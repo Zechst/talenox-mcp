@@ -1397,6 +1397,50 @@ describe("createTalenoxOAuthProvider", () => {
 
     await expect(provider.verifyAccessToken("never-issued")).rejects.toThrow();
   });
+
+  it("rejects replaying an already-consumed authorization code (added during /plan-eng-review)", async () => {
+    vi.spyOn(talenoxOAuth, "exchangeCodeForTokens").mockResolvedValue({
+      access_token: "acc-1",
+      refresh_token: "talenox-ref-1",
+      expires_in: 1800,
+    });
+    const { provider, callbackHandler } = createTalenoxOAuthProvider({
+      publicBaseUrl: "https://example.onrender.com",
+      talenoxClientId: "client-123",
+      talenoxClientSecret: "secret-abc",
+      scope: "payroll",
+      shim,
+    });
+
+    let talenoxRedirectUrl = "";
+    await provider.authorize(
+      { client_id: "mcp-client-1" } as any,
+      {
+        redirectUri: "https://claude.ai/oauth/callback",
+        state: "client-state-1",
+        codeChallenge: "challenge-abc",
+      } as any,
+      { redirect: (url: string) => (talenoxRedirectUrl = url) } as any,
+    );
+    const handoffState = new URL(talenoxRedirectUrl).searchParams.get("state")!;
+
+    let finalRedirectUrl = "";
+    await callbackHandler(
+      { query: { code: "talenox-auth-code", state: handoffState } } as any,
+      { redirect: (url: string) => (finalRedirectUrl = url) } as any,
+      () => {},
+    );
+    const mcpAuthCode = new URL(finalRedirectUrl).searchParams.get("code")!;
+
+    // First exchange succeeds and consumes the code (single-use, per PendingAuthorizations)
+    await provider.exchangeAuthorizationCode({ client_id: "mcp-client-1" } as any, mcpAuthCode);
+
+    // Replaying the same code must fail — this is what actually prevents an
+    // intercepted authorization code from being redeemed twice.
+    await expect(
+      provider.exchangeAuthorizationCode({ client_id: "mcp-client-1" } as any, mcpAuthCode),
+    ).rejects.toThrow();
+  });
 });
 ```
 
@@ -1568,7 +1612,7 @@ export function createTalenoxOAuthProvider(config: {
 - [ ] **Step 9: Run test to verify it passes**
 
 Run: `npx vitest run tests/auth/oauth-provider.test.ts`
-Expected: PASS (3 tests)
+Expected: PASS (4 tests)
 
 - [ ] **Step 10: Commit**
 
@@ -1823,6 +1867,7 @@ import { describe, it, expect, vi } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerEmployeeTools } from "../../src/tools/employees.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
+import { TalenoxApiError } from "../../src/talenox/errors.js";
 
 function makeMockTalenox() {
   return {
@@ -1863,6 +1908,21 @@ describe("employee tools", () => {
 
     expect(talenox.post).toHaveBeenCalledWith("employees", { name: "New" });
     expect(result.content[0].text).toContain("2");
+  });
+
+  it("surfaces a thrown TalenoxApiError as an MCP error result (added during /plan-eng-review)", async () => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = makeMockTalenox();
+    (talenox.get as any).mockRejectedValue(new TalenoxApiError(404, "employee not found"));
+
+    registerEmployeeTools(server, () => ({ talenox }));
+
+    const tool = (server as any)._registeredTools?.get_employee
+      ?? (server as any).tools?.get_employee;
+    const result = await tool.callback({ id: "999" }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("employee not found");
   });
 });
 ```
@@ -1960,7 +2020,7 @@ export function registerEmployeeTools(
 - [ ] **Step 4: Install `zod` and run test to verify it passes**
 
 Run: `npm install zod && npx vitest run tests/tools/employees.test.ts`
-Expected: PASS (2 tests) — if the internal tool-lookup expression needed adjusting per the note above, confirm it now matches the installed SDK version.
+Expected: PASS (3 tests) — if the internal tool-lookup expression needed adjusting per the note above, confirm it now matches the installed SDK version.
 
 - [ ] **Step 5: Commit**
 
@@ -1991,6 +2051,7 @@ import { describe, it, expect, vi } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerPayItemTools } from "../../src/tools/pay-items.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
+import { TalenoxApiError } from "../../src/talenox/errors.js";
 
 describe("pay item tools", () => {
   it("registers list_pay_items, calling GET custom_pay_items", async () => {
@@ -2006,6 +2067,20 @@ describe("pay item tools", () => {
     expect(talenox.get).toHaveBeenCalledWith("custom_pay_items");
     expect(result.content[0].text).toContain("Bonus");
   });
+
+  it("surfaces a thrown TalenoxApiError as an MCP error result (added during /plan-eng-review)", async () => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = { get: vi.fn().mockRejectedValue(new TalenoxApiError(500, "upstream error")) } as unknown as TalenoxClient;
+
+    registerPayItemTools(server, () => ({ talenox }));
+
+    const tool = (server as any)._registeredTools?.list_pay_items
+      ?? (server as any).tools?.list_pay_items;
+    const result = await tool.callback({}, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("upstream error");
+  });
 });
 ```
 
@@ -2015,6 +2090,7 @@ import { describe, it, expect, vi } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerCostCentreTools } from "../../src/tools/cost-centres.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
+import { TalenoxApiError } from "../../src/talenox/errors.js";
 
 describe("cost centre tools", () => {
   it("registers list_cost_centres, calling GET cost_centres", async () => {
@@ -2029,6 +2105,20 @@ describe("cost centre tools", () => {
 
     expect(talenox.get).toHaveBeenCalledWith("cost_centres");
     expect(result.content[0].text).toContain("Engineering");
+  });
+
+  it("surfaces a thrown TalenoxApiError as an MCP error result (added during /plan-eng-review)", async () => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = { get: vi.fn().mockRejectedValue(new TalenoxApiError(500, "upstream error")) } as unknown as TalenoxClient;
+
+    registerCostCentreTools(server, () => ({ talenox }));
+
+    const tool = (server as any)._registeredTools?.list_cost_centres
+      ?? (server as any).tools?.list_cost_centres;
+    const result = await tool.callback({}, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("upstream error");
   });
 });
 ```
@@ -2097,7 +2187,7 @@ export function registerCostCentreTools(
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `npx vitest run tests/tools/pay-items.test.ts tests/tools/cost-centres.test.ts`
-Expected: PASS (2 tests)
+Expected: PASS (4 tests)
 
 - [ ] **Step 6: Commit**
 
@@ -2414,7 +2504,7 @@ git commit -m "feat(tools): add payroll payment/process/publish/payslip tools wi
 
 ```typescript
 // tests/tools/index.test.ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAllTools } from "../../src/tools/index.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
@@ -2452,6 +2542,25 @@ describe("registerAllTools", () => {
       expect(names).toContain(name);
     }
     expect(names.length).toBe(expected.length);
+  });
+
+  it("withInvocationLogging passes args through unmodified and returns the real result (added during /plan-eng-review)", async () => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = { get: vi.fn().mockResolvedValue({ id: 1, name: "Jane" }) } as unknown as TalenoxClient;
+
+    registerAllTools(server, () => ({ talenox }));
+
+    const tool = (server as any)._registeredTools?.get_employee
+      ?? (server as any).tools?.get_employee;
+
+    const result = await tool.callback({ id: "1" }, {});
+
+    // Proves the logging wrapper didn't swallow args or mutate the result —
+    // this test exists specifically for the wrapper added this review, not
+    // just as a duplicate of Task 9's employees.test.ts coverage.
+    expect(talenox.get).toHaveBeenCalledWith("employees/1");
+    expect(result.content[0].text).toContain("Jane");
+    expect(result.isError).toBeUndefined();
   });
 });
 ```
@@ -2523,7 +2632,7 @@ export function registerAllTools(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/tools/index.test.ts`
-Expected: PASS (1 test) — the existing test only asserts tool names are registered, which still holds since the logging wrapper is transparent to registration; it does not yet assert on log output.
+Expected: PASS (2 tests) — the registration test and the added passthrough test (verifying `withInvocationLogging` doesn't mutate args or results) together cover both that tools register correctly and that the logging wrapper is behaviorally transparent.
 
 - [ ] **Step 5: Wire the transport into `src/mcp-server.ts`**
 
