@@ -1,3 +1,5 @@
+import { withQueryParams } from "../util/url.js";
+
 const TALENOX_AUTHORIZE_URL = "https://app.talenox.com/oauth/authorize";
 const TALENOX_TOKEN_URL = "https://app.talenox.com/oauth/token";
 
@@ -13,22 +15,20 @@ export function buildAuthorizeUrl(params: {
   scope: string;
   state: string;
 }): string {
-  const url = new URL(TALENOX_AUTHORIZE_URL);
-  url.searchParams.set("client_id", params.clientId);
-  url.searchParams.set("redirect_uri", params.redirectUri);
-  url.searchParams.set("scope", params.scope);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("state", params.state);
+  const url = withQueryParams(new URL(TALENOX_AUTHORIZE_URL), {
+    client_id: params.clientId,
+    redirect_uri: params.redirectUri,
+    scope: params.scope,
+    response_type: "code",
+    state: params.state,
+  });
   return url.toString();
 }
 
 async function postTokenRequest(
   params: Record<string, string>,
 ): Promise<TalenoxTokenResponse> {
-  const url = new URL(TALENOX_TOKEN_URL);
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value);
-  }
+  const url = withQueryParams(new URL(TALENOX_TOKEN_URL), params);
   const response = await fetch(url.toString(), { method: "POST" });
   if (!response.ok) {
     const body = await response.text();

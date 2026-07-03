@@ -2,14 +2,14 @@ import { describe, it, expect, vi } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAllTools } from "../../src/tools/index.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
+import { getRegisteredTool, getRegisteredTools } from "./test-utils.js";
 
 describe("registerAllTools", () => {
   it("registers every v1 tool name exactly once", () => {
     const server = new McpServer({ name: "test", version: "0.0.0" });
     registerAllTools(server, () => ({ talenox: {} as TalenoxClient }));
 
-    const registered =
-      (server as any)._registeredTools ?? (server as any).tools ?? {};
+    const registered = getRegisteredTools(server);
     const names = Object.keys(registered);
 
     const expected = [
@@ -44,8 +44,7 @@ describe("registerAllTools", () => {
 
     registerAllTools(server, () => ({ talenox }));
 
-    const tool = (server as any)._registeredTools?.get_employee
-      ?? (server as any).tools?.get_employee;
+    const tool = getRegisteredTool(server, "get_employee");
 
     // Installed SDK stores the registered handler under `.handler`
     // (older/example shape used `.callback`); fall back for either.

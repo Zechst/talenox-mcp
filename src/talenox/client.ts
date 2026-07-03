@@ -1,4 +1,5 @@
 import { TalenoxApiError } from "./errors.js";
+import { withQueryParams } from "../util/url.js";
 
 const BASE_URL = "https://api.talenox.com/api/v2/";
 
@@ -10,12 +11,9 @@ export class TalenoxClient {
     path: string,
     options: { query?: Record<string, string>; body?: unknown } = {},
   ): Promise<T> {
-    const url = new URL(path, BASE_URL);
-    if (options.query) {
-      for (const [key, value] of Object.entries(options.query)) {
-        url.searchParams.set(key, value);
-      }
-    }
+    const url = options.query
+      ? withQueryParams(new URL(path, BASE_URL), options.query)
+      : new URL(path, BASE_URL);
 
     const response = await fetch(url.toString(), {
       method,

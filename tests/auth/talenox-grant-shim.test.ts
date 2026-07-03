@@ -1,13 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { TokenStore } from "../../src/auth/token-store.js";
 import {
   TalenoxGrantShim,
   GrantNotFoundError,
 } from "../../src/auth/talenox-grant-shim.js";
 import * as talenoxOAuth from "../../src/auth/talenox-oauth-client.js";
+import { setupTokenStore, teardownTokenStore } from "./test-utils.js";
 
 describe("TalenoxGrantShim", () => {
   let dir: string;
@@ -16,9 +14,7 @@ describe("TalenoxGrantShim", () => {
   let idCounter: number;
 
   beforeEach(() => {
-    process.env.MCP_ENCRYPTION_KEY = "0".repeat(63) + "1";
-    dir = mkdtempSync(join(tmpdir(), "talenox-mcp-test-"));
-    store = new TokenStore(join(dir, "tokens.db"));
+    ({ store, dir } = setupTokenStore());
     idCounter = 0;
     shim = new TalenoxGrantShim(
       store,
@@ -32,8 +28,7 @@ describe("TalenoxGrantShim", () => {
   });
 
   afterEach(() => {
-    store.close();
-    rmSync(dir, { recursive: true, force: true });
+    teardownTokenStore({ store, dir });
     vi.restoreAllMocks();
   });
 

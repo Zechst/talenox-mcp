@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerPayItemTools } from "../../src/tools/pay-items.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
 import { TalenoxApiError } from "../../src/talenox/errors.js";
+import { getRegisteredTool } from "./test-utils.js";
 
 describe("pay item tools", () => {
   it("registers list_pay_items, calling GET custom_pay_items", async () => {
@@ -11,8 +12,7 @@ describe("pay item tools", () => {
 
     registerPayItemTools(server, () => ({ talenox }));
 
-    const tool = (server as any)._registeredTools?.list_pay_items
-      ?? (server as any).tools?.list_pay_items;
+    const tool = getRegisteredTool(server, "list_pay_items");
     const result = await tool.handler({}, {});
 
     expect(talenox.get).toHaveBeenCalledWith("custom_pay_items");
@@ -25,8 +25,7 @@ describe("pay item tools", () => {
 
     registerPayItemTools(server, () => ({ talenox }));
 
-    const tool = (server as any)._registeredTools?.list_pay_items
-      ?? (server as any).tools?.list_pay_items;
+    const tool = getRegisteredTool(server, "list_pay_items");
     const result = await tool.handler({}, {});
 
     expect(result.isError).toBe(true);

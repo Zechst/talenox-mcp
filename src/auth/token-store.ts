@@ -42,6 +42,7 @@ export class TokenStore {
   }
 
   createGrant(grantId: string, grant: StoredGrant): void {
+    this.sweepExpired(); // bounds findGrantByAccessToken's full-table scan to live grants
     this.db
       .prepare(
         `INSERT INTO grants (grant_id, access_token, refresh_token, expires_at)
@@ -53,6 +54,10 @@ export class TokenStore {
         refreshToken: encrypt(grant.talenoxRefreshToken),
         expiresAt: grant.expiresAt,
       });
+  }
+
+  private sweepExpired(): void {
+    this.db.prepare(`DELETE FROM grants WHERE expires_at <= ?`).run(Date.now());
   }
 
   getGrant(grantId: string): StoredGrant | null {

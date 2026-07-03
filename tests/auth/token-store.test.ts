@@ -1,22 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { TokenStore } from "../../src/auth/token-store.js";
+import { setupTokenStore, teardownTokenStore } from "./test-utils.js";
 
 describe("TokenStore", () => {
   let dir: string;
   let store: TokenStore;
 
   beforeEach(() => {
-    process.env.MCP_ENCRYPTION_KEY = "0".repeat(63) + "1";
-    dir = mkdtempSync(join(tmpdir(), "talenox-mcp-test-"));
-    store = new TokenStore(join(dir, "tokens.db"));
+    ({ store, dir } = setupTokenStore());
   });
 
   afterEach(() => {
-    store.close();
-    rmSync(dir, { recursive: true, force: true });
+    teardownTokenStore({ store, dir });
   });
 
   it("returns null for an unknown grant", () => {

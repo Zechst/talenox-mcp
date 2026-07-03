@@ -1,10 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import request from "supertest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { TokenStore } from "../src/auth/token-store.js";
 import { createApp } from "../src/mcp-server.js";
+import { setupTokenStore, teardownTokenStore } from "./auth/test-utils.js";
 
 describe("createApp", () => {
   let dir: string;
@@ -12,9 +10,7 @@ describe("createApp", () => {
   let app: ReturnType<typeof createApp>;
 
   beforeEach(() => {
-    process.env.MCP_ENCRYPTION_KEY = "0".repeat(63) + "1";
-    dir = mkdtempSync(join(tmpdir(), "talenox-mcp-test-"));
-    store = new TokenStore(join(dir, "tokens.db"));
+    ({ store, dir } = setupTokenStore());
     app = createApp({
       publicBaseUrl: "https://example.onrender.com",
       talenoxClientId: "client-123",
@@ -25,8 +21,7 @@ describe("createApp", () => {
   });
 
   afterEach(() => {
-    store.close();
-    rmSync(dir, { recursive: true, force: true });
+    teardownTokenStore({ store, dir });
     vi.restoreAllMocks();
   });
 

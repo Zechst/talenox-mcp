@@ -11,12 +11,17 @@ export type { ToolContext };
 // individually — caught as a gap during /plan-ceo-review's Section 8
 // observability pass: with zero logging, a bad payroll run has no trail to
 // reconstruct what Claude actually called.
+type ToolHandler = (args: unknown, extra: unknown) => Promise<{ isError?: boolean }>;
+type RegisterTool = (name: string, schema: unknown, handler: ToolHandler) => unknown;
+
 function withInvocationLogging(server: McpServer): McpServer {
-  const originalRegisterTool = server.registerTool.bind(server);
-  (server as any).registerTool = (name: string, schema: unknown, handler: Function) => {
-    const wrappedHandler = async (args: any, extra: unknown) => {
+  const originalRegisterTool = server.registerTool.bind(server) as RegisterTool;
+  const patched: RegisterTool = (name, schema, handler) => {
+    const wrappedHandler: ToolHandler = async (args, extra) => {
       const dryRun =
-        args && typeof args === "object" && "dry_run" in args ? args.dry_run : undefined;
+        args && typeof args === "object" && "dry_run" in args
+          ? (args as { dry_run?: boolean }).dry_run
+          : undefined;
       console.log(JSON.stringify({ event: "tool.invoke", tool: name, dryRun }));
       try {
         const result = await handler(args, extra);
@@ -35,8 +40,9 @@ function withInvocationLogging(server: McpServer): McpServer {
         throw err;
       }
     };
-    return originalRegisterTool(name, schema as any, wrappedHandler as any);
+    return originalRegisterTool(name, schema, wrappedHandler);
   };
+  (server as unknown as { registerTool: RegisterTool }).registerTool = patched;
   return server;
 }
 

@@ -3,10 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerPayrollTools } from "../../src/tools/payroll.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
 import { TalenoxApiError } from "../../src/talenox/errors.js";
-
-function getTool(server: any, name: string) {
-  return (server as any)._registeredTools?.[name] ?? (server as any).tools?.[name];
-}
+import { getRegisteredTool as getTool } from "./test-utils.js";
 
 describe("payroll tools", () => {
   it("create_adhoc_payment calls POST payroll/adhoc_payments with the given payment", async () => {

@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerCostCentreTools } from "../../src/tools/cost-centres.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
 import { TalenoxApiError } from "../../src/talenox/errors.js";
+import { getRegisteredTool } from "./test-utils.js";
 
 describe("cost centre tools", () => {
   it("registers list_cost_centres, calling GET cost_centres", async () => {
@@ -11,8 +12,7 @@ describe("cost centre tools", () => {
 
     registerCostCentreTools(server, () => ({ talenox }));
 
-    const tool = (server as any)._registeredTools?.list_cost_centres
-      ?? (server as any).tools?.list_cost_centres;
+    const tool = getRegisteredTool(server, "list_cost_centres");
     const result = await tool.handler({}, {});
 
     expect(talenox.get).toHaveBeenCalledWith("cost_centres");
@@ -25,8 +25,7 @@ describe("cost centre tools", () => {
 
     registerCostCentreTools(server, () => ({ talenox }));
 
-    const tool = (server as any)._registeredTools?.list_cost_centres
-      ?? (server as any).tools?.list_cost_centres;
+    const tool = getRegisteredTool(server, "list_cost_centres");
     const result = await tool.handler({}, {});
 
     expect(result.isError).toBe(true);

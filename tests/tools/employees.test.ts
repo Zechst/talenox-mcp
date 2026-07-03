@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerEmployeeTools } from "../../src/tools/employees.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
 import { TalenoxApiError } from "../../src/talenox/errors.js";
+import { getRegisteredTool } from "./test-utils.js";
 
 function makeMockTalenox() {
   return {
@@ -11,15 +12,6 @@ function makeMockTalenox() {
     put: vi.fn(),
     delete: vi.fn(),
   } as unknown as TalenoxClient;
-}
-
-// Note: McpServer's internal storage of registered tools (`_registeredTools`)
-// is not part of its public API. The installed SDK version (verified by
-// reading node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js)
-// stores the handler under `.handler`, not `.callback` as an earlier plan
-// draft assumed — adjusted here accordingly.
-function getRegisteredTool(server: McpServer, name: string) {
-  return (server as any)._registeredTools?.[name] ?? (server as any).tools?.[name];
 }
 
 describe("employee tools", () => {

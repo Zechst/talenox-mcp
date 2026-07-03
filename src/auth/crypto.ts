@@ -1,13 +1,17 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 
+let cachedKey: Buffer | undefined;
+
 function getKey(): Buffer {
+  if (cachedKey) return cachedKey;
   const hex = process.env.MCP_ENCRYPTION_KEY;
   if (!hex || hex.length !== 64) {
     throw new Error(
       "MCP_ENCRYPTION_KEY must be set to a 64-character hex string (32 bytes)",
     );
   }
-  return Buffer.from(hex, "hex");
+  cachedKey = Buffer.from(hex, "hex");
+  return cachedKey;
 }
 
 export function encrypt(plaintext: string): string {
