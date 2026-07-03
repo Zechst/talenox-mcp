@@ -3072,17 +3072,81 @@ _No new tasks from Sections 1, 4, 7, 9, 10, 11 — no unaddressed findings there
 - The Step 0F mode-selection question (HOLD SCOPE / SELECTIVE EXPANSION / SCOPE EXPANSION) went unanswered after 60s; proceeded with the recommended HOLD SCOPE default per the user's prior explicit scope-locking behavior earlier in this conversation. If SELECTIVE EXPANSION or SCOPE EXPANSION was actually intended, re-run this review section with that mode selected.
 - The four Section 2/3/5/8 findings (boot validation, error-propagation test, DRY textResult, logging + sweep) were also auto-applied after a 60s AskUserQuestion timeout, using the recommended option for each. All four are additive, non-destructive changes to the plan document only (no code has been written yet) — review the diff in `docs/superpowers/plans/2026-07-03-talenox-mcp-implementation.md` and flag anything you'd rather revert before implementation begins.
 
+## Eng Review — NOT in Scope
+
+- **Design Review** — no UI scope exists (tool descriptions are metadata, not a UI surface); `/plan-design-review` doesn't apply here.
+- **Full parallelization via git worktrees** — the dependency table above shows real parallel lanes exist, but for a solo personal project the coordination overhead likely outweighs the benefit; sequential Task 1→13 execution is the recommended default (see Worktree Parallelization Strategy above).
+- **Codex outside-voice pass** — not probed this session (same as the CEO review); optional, not required to proceed.
+
+## Eng Review — What Already Exists
+
+Same three references as the CEO review (`xero-mcp-server`'s tool pattern, `lark-mcp-oauth`'s remote-OAuth shape, `@modelcontextprotocol/sdk`'s auth router) — no additional existing code found during this pass that the plan should reuse instead of building.
+
+## Eng Review — Failure Modes (delta from CEO review)
+
+The CEO review's Failure Modes Registry stands; this review adds one row surfaced by the test-coverage diagram:
+
+| Codepath | Failure Mode | Rescued? | Test? | User Sees | Logged? |
+|---|---|---|---|---|---|
+| `oauth-provider.ts` `exchangeAuthorizationCode` | Replayed/already-consumed authorization code | Y (via `PendingAuthorizations.consume()`'s single-use semantics) | Y (added this review) | Standard OAuth error to the client | Not explicitly (falls under the general provider logging added in the CEO review) |
+
+No CRITICAL GAP — the replay-prevention behavior existed before this review (built into `PendingAuthorizations`), this review only added the direct test asserting it at the OAuth-provider integration point.
+
+## Eng Review — Implementation Tasks
+
+- [ ] **T5 (P2, human: ~15min / CC: ~3min)** — tools — add error-propagation tests to employees/pay-items/cost-centres
+  - Surfaced by: Test Review — 3 of 4 tool files lacked the error-propagation test payroll.ts got in the CEO review
+  - Files: `tests/tools/employees.test.ts`, `tests/tools/pay-items.test.ts`, `tests/tools/cost-centres.test.ts` (already written into Tasks 9/10)
+  - Verify: `npx vitest run tests/tools/employees.test.ts tests/tools/pay-items.test.ts tests/tools/cost-centres.test.ts`
+- [ ] **T6 (P2, human: ~10min / CC: ~2min)** — auth — add OAuth authorization-code replay test
+  - Surfaced by: Test Review — replay/double-spend of an mcpAuthCode wasn't directly asserted
+  - Files: `tests/auth/oauth-provider.test.ts` (already written into Task 7)
+  - Verify: `npx vitest run tests/auth/oauth-provider.test.ts`
+- [ ] **T7 (P3, human: ~10min / CC: ~2min)** — tools — add logging-wrapper passthrough test
+  - Surfaced by: Test Review — `withInvocationLogging` (CEO review addition) had no direct test
+  - Files: `tests/tools/index.test.ts` (already written into Task 12)
+  - Verify: `npx vitest run tests/tools/index.test.ts`
+
+_No new tasks from Architecture, Code Quality, or Performance reviews — zero findings in each._
+
+## Eng Review — Completion Summary
+
+```
+- Step 0: Scope Challenge — scope accepted as-is (complexity check triggered
+  automatically at 9 new classes/20 files; confirmed essential, not accidental,
+  given PKCE + Talenox refresh-quirk constraints already locked in CEO review)
+- Architecture Review: 0 issues found (already hardened by CEO review)
+- Code Quality Review: 0 issues found (DRY violation already fixed)
+- Test Review: diagram produced, 3 gaps identified — all 3 fixed
+- Performance Review: 0 issues found
+- NOT in scope: written
+- What already exists: written
+- TODOS.md updates: 0 new items proposed (CEO review's 3 P3 items still stand)
+- Failure modes: 0 critical gaps flagged (1 non-critical row added)
+- Outside voice: skipped (not probed this session)
+- Parallelization: 3 lanes (auth chain, Talenox client, tools) / mostly sequential
+  within each lane, converging at Task 12
+- Unresolved decisions: 1 (scope-target confirmation defaulted, see below)
+```
+
+## Eng Review — Unresolved Decisions
+
+- The initial scope-gate question (which target to review) went unanswered after 60s; proceeded with the recommended target (this plan file) since it was the obvious continuation of the just-completed CEO review.
+- The complexity-check AskUserQuestion (reduce scope vs proceed as-is) was answered — "Proceed as-is" was explicitly chosen, not defaulted.
+- The three test-gap AskUserQuestions (error-propagation coverage, replay test, logging passthrough test) went unanswered after 60s; proceeded with the recommended (add the test) option for all three, consistent with this project's engineering preference for thorough test coverage stated at the start of this skill.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | 4 findings, 4 fixed; 1 unresolved (mode selection defaulted) |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | not run |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | not run |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open | 3 test gaps, 3 fixed; 1 unresolved (scope-target confirmation defaulted) |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | N/A (no UI scope) |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | not run |
 
-**VERDICT:** CEO review complete with all findings resolved in-plan; eng review required before implementation (Eng Review not yet run — this is a personal-scope project, so running `/plan-eng-review` is optional but recommended before starting Task 1, given the OAuth architecture is genuinely nontrivial).
+**VERDICT:** CEO + ENG CLEARED — all findings from both reviews resolved in-plan. Ready to implement (Task 1 onward). Codex outside-voice and DX review remain optional and were not run.
 
 **UNRESOLVED DECISIONS:**
-- Mode selection (HOLD SCOPE vs SELECTIVE/SCOPE EXPANSION) defaulted after a 60s timeout — confirm HOLD SCOPE was the right call, or re-run with a different mode.
+- Mode selection (HOLD SCOPE vs SELECTIVE/SCOPE EXPANSION) defaulted after a 60s timeout in the CEO review — confirm HOLD SCOPE was the right call, or re-run that review with a different mode.
+- Scope-target confirmation for this eng review defaulted after a 60s timeout — confirm the plan file (not the branch diff or another target) was the intended review target.
