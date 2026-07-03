@@ -111,6 +111,7 @@ describe("createTalenoxOAuthProvider", () => {
     );
     expect(tokens.access_token).toBe("acc-1");
     expect(tokens.refresh_token).toBeTruthy();
+    expect(tokens.token_type).toBe("Bearer");
 
     vi.spyOn(talenoxOAuth, "refreshTokens").mockResolvedValue({
       access_token: "acc-2",
@@ -122,6 +123,7 @@ describe("createTalenoxOAuthProvider", () => {
       tokens.refresh_token,
     );
     expect(refreshed.access_token).toBe("acc-2");
+    expect(refreshed.token_type).toBe("Bearer");
   });
 
   it("verifyAccessToken resolves valid tokens and rejects unknown ones", async () => {

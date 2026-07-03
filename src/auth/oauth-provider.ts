@@ -113,6 +113,7 @@ export function createTalenoxOAuthProvider(config: {
       access_token: entry.accessToken,
       refresh_token: entry.refreshToken,
       expires_in: entry.expiresIn,
+      token_type: "Bearer",
     };
   }
 
@@ -124,6 +125,7 @@ export function createTalenoxOAuthProvider(config: {
         access_token: issued.accessToken,
         refresh_token: issued.refreshToken,
         expires_in: issued.expiresIn,
+        token_type: "Bearer",
       };
     } catch (err) {
       if (err instanceof GrantNotFoundError) {
