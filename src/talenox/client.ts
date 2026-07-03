@@ -29,7 +29,8 @@ export class TalenoxClient {
       throw new TalenoxApiError(response.status, body);
     }
 
-    return (await response.json()) as T;
+    const text = await response.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
 
   get<T>(path: string, query?: Record<string, string>): Promise<T> {

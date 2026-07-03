@@ -14,7 +14,7 @@ describe("TalenoxClient", () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => ({ id: 1, name: "Jane" }),
+      text: async () => JSON.stringify({ id: 1, name: "Jane" }),
     }) as unknown as typeof fetch;
 
     const client = new TalenoxClient("tok-123");
@@ -38,7 +38,7 @@ describe("TalenoxClient", () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 201,
-      json: async () => ({ id: 2 }),
+      text: async () => JSON.stringify({ id: 2 }),
     }) as unknown as typeof fetch;
 
     const client = new TalenoxClient("tok-123");
@@ -51,6 +51,19 @@ describe("TalenoxClient", () => {
         body: JSON.stringify({ name: "New Employee" }),
       }),
     );
+  });
+
+  it("does not throw on a 2xx response with an empty body (e.g. DELETE returning 204)", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 204,
+      text: async () => "",
+    }) as unknown as typeof fetch;
+
+    const client = new TalenoxClient("tok-123");
+    const result = await client.delete("employees/1");
+
+    expect(result).toBeUndefined();
   });
 
   it("throws TalenoxApiError with the response body on non-2xx", async () => {

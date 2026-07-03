@@ -1,5 +1,6 @@
 import { createApp } from "./mcp-server.js";
 import { TokenStore } from "./auth/token-store.js";
+import { ENCRYPTION_KEY_PATTERN } from "./auth/crypto.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const publicBaseUrl = process.env.PUBLIC_BASE_URL;
@@ -14,7 +15,7 @@ if (!publicBaseUrl || !talenoxClientId || !talenoxClientSecret) {
   );
 }
 
-if (!encryptionKey || !/^[0-9a-f]{64}$/i.test(encryptionKey)) {
+if (!encryptionKey || !ENCRYPTION_KEY_PATTERN.test(encryptionKey)) {
   throw new Error(
     "MCP_ENCRYPTION_KEY must be set to a 64-character hex string (32 bytes) " +
       "— generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"",

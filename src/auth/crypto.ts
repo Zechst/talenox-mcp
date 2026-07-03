@@ -1,11 +1,13 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 
+export const ENCRYPTION_KEY_PATTERN = /^[0-9a-f]{64}$/i;
+
 let cachedKey: Buffer | undefined;
 
 function getKey(): Buffer {
   if (cachedKey) return cachedKey;
   const hex = process.env.MCP_ENCRYPTION_KEY;
-  if (!hex || hex.length !== 64) {
+  if (!hex || !ENCRYPTION_KEY_PATTERN.test(hex)) {
     throw new Error(
       "MCP_ENCRYPTION_KEY must be set to a 64-character hex string (32 bytes)",
     );
