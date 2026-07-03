@@ -16,7 +16,9 @@ Leave management, Lark integration, and non-payroll Talenox resources
 1. Log into https://app.talenox.com.
 2. Top-right nav → API Settings → OAuth 2.0 developer page.
 3. Create an app: name it, set Redirect URI to
-   `https://<your-service>.onrender.com/callback`, choose scopes.
+   `https://<your-service>.onrender.com/callback`. Set the scope to exactly
+   `payroll` — the server requests this scope by default (`src/index.ts`) and
+   any mismatch will cause the OAuth authorize step to fail.
 4. Copy the generated Client ID and Client Secret.
 
 ### 2. Generate an encryption key
@@ -35,6 +37,9 @@ Keep this value stable once set — changing it invalidates all stored tokens.
   `TALENOX_CLIENT_SECRET`, `MCP_ENCRYPTION_KEY` from steps 1-2.
 - Requires the **Starter** plan (always-on, persistent disk) — tokens are
   stored on a mounted disk and would be lost on every restart on the free tier.
+- `PORT` (default `3000`) and `TOKEN_STORE_PATH` (default `/data/tokens.db` on
+  Render, via `render.yaml`) rarely need overriding — set them only if running
+  outside Render or on a different port/disk layout.
 
 ### 4. Connect clients
 

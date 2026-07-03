@@ -120,7 +120,7 @@ export function registerPayrollTools(
     getContext,
     "unpublish_payroll",
     (id) => `payroll/${id}/unpublish`,
-    "Unpublish a previously published payroll run. Supports dry_run.",
+    "Unpublish a previously published payroll run, hiding payslips from employees again. This changes live payroll state — confirm with the user before calling without dry_run.",
   );
 
   server.registerTool(

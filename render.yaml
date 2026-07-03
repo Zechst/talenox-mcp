@@ -6,6 +6,7 @@ services:
     region: singapore
     buildCommand: npm ci && npm run build
     startCommand: npm start
+    healthCheckPath: /health
     disk:
       name: talenox-mcp-data
       mountPath: /data
