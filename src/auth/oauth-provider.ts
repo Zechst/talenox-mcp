@@ -83,7 +83,20 @@ export function createTalenoxOAuthProvider(config: {
       return;
     }
 
-    const issued = await config.shim.exchangeAuthorizationCode(code);
+    let issued;
+    try {
+      issued = await config.shim.exchangeAuthorizationCode(code);
+    } catch (err) {
+      console.log(
+        JSON.stringify({
+          event: "oauth.callback.exchange_failed",
+          handoffId,
+          message: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      res.status(502).json({ error: "failed to exchange code with Talenox" });
+      return;
+    }
 
     const mcpAuthCode = finalCodes.create({
       accessToken: issued.accessToken,

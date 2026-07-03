@@ -185,4 +185,43 @@ describe("createTalenoxOAuthProvider", () => {
       provider.exchangeAuthorizationCode({ client_id: "mcp-client-1" } as any, mcpAuthCode),
     ).rejects.toThrow();
   });
+
+  it("callbackHandler returns a clean 502 instead of hanging when Talenox's code exchange fails (added during /code-review)", async () => {
+    vi.spyOn(talenoxOAuth, "exchangeCodeForTokens").mockRejectedValue(
+      new Error("network timeout talking to Talenox"),
+    );
+
+    const { provider, callbackHandler } = createTalenoxOAuthProvider({
+      publicBaseUrl: "https://example.onrender.com",
+      talenoxClientId: "client-123",
+      talenoxClientSecret: "secret-abc",
+      scope: "payroll",
+      shim,
+    });
+
+    let talenoxRedirectUrl = "";
+    await provider.authorize(
+      { client_id: "mcp-client-1" } as any,
+      {
+        redirectUri: "https://claude.ai/oauth/callback",
+        state: "client-state-1",
+        codeChallenge: "challenge-abc",
+      } as any,
+      { redirect: (url: string) => (talenoxRedirectUrl = url) } as any,
+    );
+    const handoffState = new URL(talenoxRedirectUrl).searchParams.get("state")!;
+
+    const statusSpy = vi.fn().mockReturnThis();
+    const jsonSpy = vi.fn();
+    const fakeReq = { query: { code: "talenox-auth-code", state: handoffState } } as any;
+    const fakeRes = { status: statusSpy, json: jsonSpy, redirect: vi.fn() } as any;
+
+    await callbackHandler(fakeReq, fakeRes, () => {});
+
+    expect(statusSpy).toHaveBeenCalledWith(502);
+    expect(jsonSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.any(String) }),
+    );
+    expect(fakeRes.redirect).not.toHaveBeenCalled();
+  });
 });
