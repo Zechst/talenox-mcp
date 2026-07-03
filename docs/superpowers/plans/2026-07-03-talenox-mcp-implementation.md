@@ -1128,7 +1128,7 @@ git commit -m "feat(talenox): add API client with bearer auth and error mapping"
 **Interfaces:**
 - Consumes: `TalenoxGrantShim`/`GrantNotFoundError` (Task 5), `buildAuthorizeUrl` (Task 4).
 - Produces:
-  - `class PendingAuthorizations { constructor(ttlMs?: number, idGenerator?: () => string); create(payload: unknown): string; consume(id: string): unknown | null }` — in-memory, TTL-expiring (default 5 minutes), single-use (`consume` deletes on read). Ephemeral by design: a lost in-flight authorization just means the user retries login — no durability requirement, unlike the grant store.
+  - `class PendingAuthorizations { constructor(ttlMs?: number, idGenerator?: () => string); create(payload: unknown): string; consume(id: string): unknown | null }` — in-memory, TTL-expiring (default 5 minutes), single-use (`consume` deletes on read). Ephemeral by design: a lost in-flight authorization just means the user retries login — no durability requirement, unlike the grant store. `create()` opportunistically sweeps expired entries before inserting (caught during `/plan-ceo-review`'s Section 3 security pass: without this, abandoned/never-completed `/authorize` attempts would grow the map unbounded, since `consume`/`peek` only clean up entries that are actually read).
   - `function createTalenoxOAuthProvider(config: { publicBaseUrl: string; talenoxClientId: string; talenoxClientSecret: string; scope: string; shim: TalenoxGrantShim }): { provider: OAuthServerProviderShape; callbackHandler: express.RequestHandler }`. The returned `provider` object matches the SDK's `OAuthServerProvider` interface (see implementer note below) with:
     - `clientsStore` — minimal in-memory `getClient`/`registerClient` (dynamic client registration; ephemeral across restarts, acceptable since claude.ai re-registers automatically on reconnect, same tradeoff as `PendingAuthorizations`).
     - `authorize(client, params, res)` — stores `{ clientRedirectUri, clientState, codeChallenge, codeChallengeMethod }` in a `PendingAuthorizations` instance (the "handoff"), redirects `res` to Talenox's real authorize URL with `state` set to the handoff id.
@@ -1167,6 +1167,18 @@ describe("PendingAuthorizations", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(pending.consume(id)).toBeNull();
   });
+
+  it("sweeps expired entries opportunistically on create(), bounding memory growth", async () => {
+    let counter = 0;
+    const pending = new PendingAuthorizations(10, () => `id-${++counter}`); // 10ms TTL
+    pending.create({ abandoned: true }); // id-1, will expire and never be consumed
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    pending.create({ fresh: true }); // id-2 — this create() call should sweep id-1 away
+
+    expect((pending as any).entries.size).toBe(1);
+    expect((pending as any).entries.has("id-2")).toBe(true);
+  });
 });
 ```
 
@@ -1194,6 +1206,7 @@ export class PendingAuthorizations {
   ) {}
 
   create(payload: unknown): string {
+    this.sweep(); // opportunistic cleanup — bounds memory growth from abandoned/never-completed authorize attempts without needing a background timer
     const id = this.idGenerator();
     this.entries.set(id, { payload, expiresAt: Date.now() + this.ttlMs });
     return id;
@@ -1212,13 +1225,20 @@ export class PendingAuthorizations {
     if (!entry || entry.expiresAt <= Date.now()) return null;
     return entry.payload;
   }
+
+  private sweep(): void {
+    const now = Date.now();
+    for (const [id, entry] of this.entries) {
+      if (entry.expiresAt <= now) this.entries.delete(id);
+    }
+  }
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/auth/pending-authorizations.test.ts`
-Expected: PASS (3 tests)
+Expected: PASS (4 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1449,6 +1469,7 @@ export function createTalenoxOAuthProvider(config: {
       state: handoffId,
     });
 
+    console.log(JSON.stringify({ event: "oauth.authorize.redirect", handoffId }));
     res.redirect(url);
   }
 
@@ -1458,6 +1479,9 @@ export function createTalenoxOAuthProvider(config: {
     const handoff = handoffs.consume(handoffId) as HandoffPayload | null;
 
     if (!code || !handoff) {
+      console.log(
+        JSON.stringify({ event: "oauth.callback.invalid_handoff", handoffId }),
+      );
       res.status(400).json({ error: "invalid or expired authorization handoff" });
       return;
     }
@@ -1470,6 +1494,8 @@ export function createTalenoxOAuthProvider(config: {
       expiresIn: issued.expiresIn,
       codeChallenge: handoff.codeChallenge,
     } satisfies FinalCodePayload);
+
+    console.log(JSON.stringify({ event: "oauth.callback.exchanged", handoffId }));
 
     const redirectUrl = new URL(handoff.clientRedirectUri);
     redirectUrl.searchParams.set("code", mcpAuthCode);
@@ -1496,6 +1522,7 @@ export function createTalenoxOAuthProvider(config: {
   async function exchangeRefreshToken(_client: unknown, refreshToken: string) {
     try {
       const issued = await config.shim.refresh(refreshToken);
+      console.log(JSON.stringify({ event: "oauth.refresh.success" }));
       return {
         access_token: issued.accessToken,
         refresh_token: issued.refreshToken,
@@ -1503,6 +1530,7 @@ export function createTalenoxOAuthProvider(config: {
       };
     } catch (err) {
       if (err instanceof GrantNotFoundError) {
+        console.log(JSON.stringify({ event: "oauth.refresh.invalid_grant" }));
         throw new Error("invalid_grant"); // TODO(implementer): map to the SDK's expected invalid-grant error type
       }
       throw err;
@@ -1512,6 +1540,7 @@ export function createTalenoxOAuthProvider(config: {
   async function verifyAccessToken(token: string) {
     const result = config.shim.verifyAccessToken(token);
     if (!result.valid) {
+      console.log(JSON.stringify({ event: "oauth.verify.invalid_token" }));
       throw new Error("invalid_token"); // TODO(implementer): map to the SDK's expected invalid-token error type
     }
     return {
@@ -1714,10 +1743,18 @@ const publicBaseUrl = process.env.PUBLIC_BASE_URL;
 const talenoxClientId = process.env.TALENOX_CLIENT_ID;
 const talenoxClientSecret = process.env.TALENOX_CLIENT_SECRET;
 const tokenStorePath = process.env.TOKEN_STORE_PATH ?? "./data/tokens.db";
+const encryptionKey = process.env.MCP_ENCRYPTION_KEY;
 
 if (!publicBaseUrl || !talenoxClientId || !talenoxClientSecret) {
   throw new Error(
     "PUBLIC_BASE_URL, TALENOX_CLIENT_ID, and TALENOX_CLIENT_SECRET must be set",
+  );
+}
+
+if (!encryptionKey || !/^[0-9a-f]{64}$/i.test(encryptionKey)) {
+  throw new Error(
+    "MCP_ENCRYPTION_KEY must be set to a 64-character hex string (32 bytes) " +
+      "— generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"",
   );
 }
 
@@ -1764,8 +1801,19 @@ git commit -m "feat(server): wire SDK OAuth router, Talenox callback, and authen
 
 **Interfaces:**
 - Consumes: `TalenoxClient` (Task 6).
-- Produces: `type ToolContext = { talenox: TalenoxClient }` (this is the canonical shape reused by every tools file from here on) and `function registerEmployeeTools(server: McpServer, getContext: (extra: unknown) => ToolContext): void`, registering `list_employees`, `get_employee`, `create_employee`, `update_employee`, `delete_employee` via `server.registerTool`.
-- Each handler calls `TalenoxClient` methods directly and returns MCP `{ content: [{ type: "text", text: JSON.stringify(result) }] }`.
+- Produces: `function textResult(data: unknown): { content: [{ type: "text", text: string }] }` in a new shared module `src/tools/shared.ts` — imported by every tools file from here on, instead of each file redefining it (a DRY violation caught during `/plan-ceo-review`'s Section 5 code-quality pass). Also produces `type ToolContext = { talenox: TalenoxClient }` (defined in `employees.ts`, the canonical shape reused by every tools file) and `function registerEmployeeTools(server: McpServer, getContext: (extra: unknown) => ToolContext): void`, registering `list_employees`, `get_employee`, `create_employee`, `update_employee`, `delete_employee` via `server.registerTool`.
+- Each handler calls `TalenoxClient` methods directly and returns MCP `{ content: [{ type: "text", text: JSON.stringify(result) }] }` via the shared `textResult` helper.
+
+- [ ] **Step 0: Write `src/tools/shared.ts`**
+
+```typescript
+// src/tools/shared.ts
+export function textResult(data: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+}
+```
+
+Run: `git add src/tools/shared.ts && git commit -m "feat(tools): add shared textResult helper"` — commit this immediately since it has no test of its own (trivial pass-through) and later steps in this task depend on importing it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1833,12 +1881,9 @@ Expected: FAIL — module not found
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { TalenoxClient } from "../talenox/client.js";
+import { textResult } from "./shared.js";
 
 export type ToolContext = { talenox: TalenoxClient };
-
-function textResult(data: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
-}
 
 export function registerEmployeeTools(
   server: McpServer,
@@ -1999,10 +2044,7 @@ Expected: FAIL — modules not found
 // src/tools/pay-items.ts
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolContext } from "./employees.js";
-
-function textResult(data: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
-}
+import { textResult } from "./shared.js";
 
 export function registerPayItemTools(
   server: McpServer,
@@ -2030,10 +2072,7 @@ export function registerPayItemTools(
 // src/tools/cost-centres.ts
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolContext } from "./employees.js";
-
-function textResult(data: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
-}
+import { textResult } from "./shared.js";
 
 export function registerCostCentreTools(
   server: McpServer,
@@ -2093,6 +2132,7 @@ import { describe, it, expect, vi } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerPayrollTools } from "../../src/tools/payroll.js";
 import type { TalenoxClient } from "../../src/talenox/client.js";
+import { TalenoxApiError } from "../../src/talenox/errors.js";
 
 function getTool(server: any, name: string) {
   return server._registeredTools?.[name] ?? server.tools?.[name];
@@ -2155,8 +2195,27 @@ describe("payroll tools", () => {
 
     expect(talenox.get).toHaveBeenCalledWith("payslips/7/pdf");
   });
+
+  it("surfaces a thrown TalenoxApiError as an MCP error result, not an unhandled rejection", async () => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = {
+      post: vi.fn().mockRejectedValue(new TalenoxApiError(422, "invalid cost centre id")),
+    } as unknown as TalenoxClient;
+    registerPayrollTools(server, () => ({ talenox }));
+
+    const tool = getTool(server, "create_adhoc_payment");
+    const result = await tool.callback({ payment: { employee_id: 5 } }, {});
+
+    // registerTool's default behavior wraps a thrown error into an isError
+    // result rather than propagating the rejection — verify that contract
+    // holds for the installed SDK version rather than assuming it.
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("invalid cost centre id");
+  });
 });
 ```
+
+**Note for implementer:** if the installed SDK's `registerTool` does NOT automatically convert a thrown error into `{isError: true, content: [...]}` (verify by running this test against the installed version), wrap every handler body in `src/tools/*.ts` in a `try { ... } catch (err) { return { isError: true, content: [{type: "text", text: String(err instanceof Error ? err.message : err)}] } }` instead of relying on the SDK default. This is the same category of SDK-version-sensitive behavior already flagged for `McpServer`/`StreamableHTTPServerTransport` in Tasks 9/12 and the OAuth provider in Task 7/8 — confirm behavior, don't assume it.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2170,10 +2229,7 @@ Expected: FAIL — module not found
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolContext } from "./employees.js";
-
-function textResult(data: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
-}
+import { textResult } from "./shared.js";
 
 function dryRunResult(path: string, body: unknown) {
   return textResult({ dry_run: true, would_send: { path, body } });
@@ -2331,7 +2387,7 @@ export function registerPayrollTools(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/tools/payroll.test.ts`
-Expected: PASS (4 tests)
+Expected: PASS (5 tests) — if the error-propagation test fails because the SDK doesn't auto-wrap thrown errors, apply the try/catch fallback from the implementer note above and re-run.
 
 - [ ] **Step 5: Commit**
 
@@ -2417,21 +2473,57 @@ import { registerPayrollTools } from "./payroll.js";
 
 export type { ToolContext };
 
+// Wraps every tool's handler with structured invocation logging (tool name,
+// dry_run flag if present, success/failure) without touching each tools file
+// individually — caught as a gap during /plan-ceo-review's Section 8
+// observability pass: with zero logging, a bad payroll run has no trail to
+// reconstruct what Claude actually called.
+function withInvocationLogging(server: McpServer): McpServer {
+  const originalRegisterTool = server.registerTool.bind(server);
+  (server as any).registerTool = (name: string, schema: unknown, handler: Function) => {
+    const wrappedHandler = async (args: any, extra: unknown) => {
+      const dryRun = args && typeof args === "object" && "dry_run" in args ? args.dry_run : undefined;
+      console.log(JSON.stringify({ event: "tool.invoke", tool: name, dryRun }));
+      try {
+        const result = await handler(args, extra);
+        console.log(
+          JSON.stringify({ event: "tool.result", tool: name, isError: Boolean(result?.isError) }),
+        );
+        return result;
+      } catch (err) {
+        console.log(
+          JSON.stringify({
+            event: "tool.error",
+            tool: name,
+            message: err instanceof Error ? err.message : String(err),
+          }),
+        );
+        throw err;
+      }
+    };
+    return originalRegisterTool(name, schema, wrappedHandler);
+  };
+  return server;
+}
+
 export function registerAllTools(
   server: McpServer,
   getContext: (extra: unknown) => ToolContext,
 ): void {
-  registerEmployeeTools(server, getContext);
-  registerPayItemTools(server, getContext);
-  registerCostCentreTools(server, getContext);
-  registerPayrollTools(server, getContext);
+  const loggedServer = withInvocationLogging(server);
+  registerEmployeeTools(loggedServer, getContext);
+  registerPayItemTools(loggedServer, getContext);
+  registerCostCentreTools(loggedServer, getContext);
+  registerPayrollTools(loggedServer, getContext);
 }
 ```
+
+**Note for implementer:** `withInvocationLogging` reassigns `server.registerTool` via a mutable cast (`as any`) because `McpServer`'s public type doesn't declare that property as writable — same SDK-internals caveat already flagged for `_registeredTools`/`tools` lookups in this task's test and Task 9's. If a future SDK version makes `registerTool` non-configurable, wrap at the `registerAllTools` call site instead (pass a thin proxy object matching `McpServer`'s public shape to each `register*Tools` function) rather than mutating the real server instance.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/tools/index.test.ts`
-Expected: PASS (1 test)
+Expected: PASS (1 test) — the existing test only asserts tool names are registered, which still holds since the logging wrapper is transparent to registration; it does not yet assert on log output.
 
 - [ ] **Step 5: Wire the transport into `src/mcp-server.ts`**
 
