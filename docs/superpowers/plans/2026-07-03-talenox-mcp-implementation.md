@@ -4,7 +4,9 @@
 
 **Goal:** Build a remote, HTTP-based MCP server that lets Claude drive Talenox payroll processing (employees, payments, process/publish, payslips), deployable to Render, with per-user OAuth against Talenox and a persistent encrypted token store.
 
-**Architecture:** Express HTTP server hosting both a hand-rolled OAuth authorization server (proxying to Talenox's OAuth, minting our own session tokens, storing Talenox tokens server-side in encrypted SQLite) and the MCP endpoint (`@modelcontextprotocol/sdk`'s `StreamableHTTPServerTransport`). Tool handlers call a thin Talenox REST client using the current session's stored (and proactively refreshed) Talenox access token.
+**Architecture:** Express HTTP server hosting `@modelcontextprotocol/sdk`'s `mcpAuthRouter` (spec-compliant OAuth 2.1 authorization server: PKCE, dynamic client registration, `/.well-known` metadata — required by claude.ai's connector flow) backed by a custom `OAuthServerProvider` implementation, plus the MCP endpoint (`StreamableHTTPServerTransport`). Talenox's `authorize` endpoint is standard and used directly; its `token`/`refresh` endpoint is nonstandard (requires a `code=<current access token>` param on refresh), so our provider mints its own opaque refresh token per grant, mapping it server-side (encrypted SQLite) to the real Talenox access+refresh token pair, and translates every refresh call into Talenox's actual required shape. Talenox's real access token passes through to the MCP client untouched — only the refresh leg is translated. Refresh is driven by the MCP client's own OAuth machinery calling our `/token` endpoint, not by a proactive per-tool-call check.
+
+> **Revision note:** an earlier version of this plan (Tasks 3/5/7/8) used hand-rolled Express OAuth routes and a proactive per-request refresh check. That design was replaced during `/plan-ceo-review` after confirming claude.ai's connector OAuth requires PKCE + dynamic client registration, which the hand-rolled routes didn't implement — see the design spec's revision history. Tasks 2, 4, 6, 9-13 are unaffected by the change.
 
 **Tech Stack:** TypeScript, Node 20+, `@modelcontextprotocol/sdk`, `express`, `better-sqlite3`, native `fetch`, `vitest` for tests.
 
@@ -237,7 +239,7 @@ git commit -m "feat(auth): add AES-256-GCM encrypt/decrypt helpers"
 
 ---
 
-### Task 3: Persistent token store
+### Task 3: Persistent grant store
 
 **Files:**
 - Create: `src/auth/token-store.ts`
@@ -246,9 +248,10 @@ git commit -m "feat(auth): add AES-256-GCM encrypt/decrypt helpers"
 **Interfaces:**
 - Consumes: `encrypt`, `decrypt` from `src/auth/crypto.ts` (Task 2).
 - Produces:
-  - `type StoredTokens = { accessToken: string; refreshToken: string; expiresAt: number }`
-  - `class TokenStore { constructor(dbPath: string); saveTokens(sessionId: string, tokens: StoredTokens): void; getTokens(sessionId: string): StoredTokens | null; deleteTokens(sessionId: string): void; close(): void }`
-  - `saveTokens` is used both for initial save and for refresh-rotation (same method, upsert semantics, single atomic write).
+  - `type StoredGrant = { talenoxAccessToken: string; talenoxRefreshToken: string; expiresAt: number }`
+  - `class TokenStore { constructor(dbPath: string); createGrant(grantId: string, grant: StoredGrant): void; getGrant(grantId: string): StoredGrant | null; findGrantByAccessToken(accessToken: string): StoredGrant | null; rotateGrant(oldGrantId: string, newGrantId: string, grant: StoredGrant): void; deleteGrant(grantId: string): void; close(): void }`
+  - `grantId` is an opaque token **we** mint (a UUID) and hand to the MCP client as its OAuth `refresh_token` — Talenox's real refresh token never leaves the server. `rotateGrant` deletes `oldGrantId` and inserts `newGrantId` in a single atomic transaction, so a crash mid-rotation can never leave both an old and new row alive, or neither.
+  - `findGrantByAccessToken` supports the `verifyAccessToken` hook (Task 5/7): the MCP client presents Talenox's real access token on every `/mcp` call, and we need to confirm it's the live token for *some* grant without knowing the grant id.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -275,42 +278,63 @@ describe("TokenStore", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("returns null for an unknown session", () => {
-    expect(store.getTokens("nope")).toBeNull();
+  it("returns null for an unknown grant", () => {
+    expect(store.getGrant("nope")).toBeNull();
   });
 
-  it("saves and retrieves tokens for a session", () => {
-    const tokens = { accessToken: "a1", refreshToken: "r1", expiresAt: 12345 };
-    store.saveTokens("session-1", tokens);
-    expect(store.getTokens("session-1")).toEqual(tokens);
+  it("creates and retrieves a grant", () => {
+    const grant = {
+      talenoxAccessToken: "a1",
+      talenoxRefreshToken: "r1",
+      expiresAt: 12345,
+    };
+    store.createGrant("grant-1", grant);
+    expect(store.getGrant("grant-1")).toEqual(grant);
   });
 
-  it("overwrites the refresh token on rotation (upsert)", () => {
-    store.saveTokens("session-1", {
-      accessToken: "a1",
-      refreshToken: "r1",
+  it("finds a grant by its current Talenox access token", () => {
+    store.createGrant("grant-1", {
+      talenoxAccessToken: "a1",
+      talenoxRefreshToken: "r1",
+      expiresAt: 12345,
+    });
+    expect(store.findGrantByAccessToken("a1")).toEqual({
+      talenoxAccessToken: "a1",
+      talenoxRefreshToken: "r1",
+      expiresAt: 12345,
+    });
+    expect(store.findGrantByAccessToken("not-a-real-token")).toBeNull();
+  });
+
+  it("rotateGrant atomically replaces the old grant id with a new one", () => {
+    store.createGrant("grant-1", {
+      talenoxAccessToken: "a1",
+      talenoxRefreshToken: "r1",
       expiresAt: 100,
     });
-    store.saveTokens("session-1", {
-      accessToken: "a2",
-      refreshToken: "r2",
+
+    store.rotateGrant("grant-1", "grant-2", {
+      talenoxAccessToken: "a2",
+      talenoxRefreshToken: "r2",
       expiresAt: 200,
     });
-    expect(store.getTokens("session-1")).toEqual({
-      accessToken: "a2",
-      refreshToken: "r2",
+
+    expect(store.getGrant("grant-1")).toBeNull();
+    expect(store.getGrant("grant-2")).toEqual({
+      talenoxAccessToken: "a2",
+      talenoxRefreshToken: "r2",
       expiresAt: 200,
     });
   });
 
-  it("deletes tokens for a session", () => {
-    store.saveTokens("session-1", {
-      accessToken: "a1",
-      refreshToken: "r1",
+  it("deletes a grant", () => {
+    store.createGrant("grant-1", {
+      talenoxAccessToken: "a1",
+      talenoxRefreshToken: "r1",
       expiresAt: 100,
     });
-    store.deleteTokens("session-1");
-    expect(store.getTokens("session-1")).toBeNull();
+    store.deleteGrant("grant-1");
+    expect(store.getGrant("grant-1")).toBeNull();
   });
 });
 ```
@@ -329,11 +353,26 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { encrypt, decrypt } from "./crypto.js";
 
-export type StoredTokens = {
-  accessToken: string;
-  refreshToken: string;
+export type StoredGrant = {
+  talenoxAccessToken: string;
+  talenoxRefreshToken: string;
   expiresAt: number;
 };
+
+type Row = {
+  grant_id: string;
+  access_token: string;
+  refresh_token: string;
+  expires_at: number;
+};
+
+function rowToGrant(row: Row): StoredGrant {
+  return {
+    talenoxAccessToken: decrypt(row.access_token),
+    talenoxRefreshToken: decrypt(row.refresh_token),
+    expiresAt: row.expires_at,
+  };
+}
 
 export class TokenStore {
   private db: Database.Database;
@@ -343,8 +382,8 @@ export class TokenStore {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS tokens (
-        session_id TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS grants (
+        grant_id TEXT PRIMARY KEY,
         access_token TEXT NOT NULL,
         refresh_token TEXT NOT NULL,
         expires_at INTEGER NOT NULL
@@ -352,41 +391,52 @@ export class TokenStore {
     `);
   }
 
-  saveTokens(sessionId: string, tokens: StoredTokens): void {
-    const upsert = this.db.prepare(`
-      INSERT INTO tokens (session_id, access_token, refresh_token, expires_at)
-      VALUES (@sessionId, @accessToken, @refreshToken, @expiresAt)
-      ON CONFLICT(session_id) DO UPDATE SET
-        access_token = excluded.access_token,
-        refresh_token = excluded.refresh_token,
-        expires_at = excluded.expires_at
-    `);
-    upsert.run({
-      sessionId,
-      accessToken: encrypt(tokens.accessToken),
-      refreshToken: encrypt(tokens.refreshToken),
-      expiresAt: tokens.expiresAt,
-    });
-  }
-
-  getTokens(sessionId: string): StoredTokens | null {
-    const row = this.db
+  createGrant(grantId: string, grant: StoredGrant): void {
+    this.db
       .prepare(
-        `SELECT access_token, refresh_token, expires_at FROM tokens WHERE session_id = ?`,
+        `INSERT INTO grants (grant_id, access_token, refresh_token, expires_at)
+         VALUES (@grantId, @accessToken, @refreshToken, @expiresAt)`,
       )
-      .get(sessionId) as
-      | { access_token: string; refresh_token: string; expires_at: number }
-      | undefined;
-    if (!row) return null;
-    return {
-      accessToken: decrypt(row.access_token),
-      refreshToken: decrypt(row.refresh_token),
-      expiresAt: row.expires_at,
-    };
+      .run({
+        grantId,
+        accessToken: encrypt(grant.talenoxAccessToken),
+        refreshToken: encrypt(grant.talenoxRefreshToken),
+        expiresAt: grant.expiresAt,
+      });
   }
 
-  deleteTokens(sessionId: string): void {
-    this.db.prepare(`DELETE FROM tokens WHERE session_id = ?`).run(sessionId);
+  getGrant(grantId: string): StoredGrant | null {
+    const row = this.db
+      .prepare(`SELECT * FROM grants WHERE grant_id = ?`)
+      .get(grantId) as Row | undefined;
+    return row ? rowToGrant(row) : null;
+  }
+
+  findGrantByAccessToken(accessToken: string): StoredGrant | null {
+    // access_token is stored encrypted (nondeterministic ciphertext, see Task 2),
+    // so this can't be a WHERE on the encrypted column — scan and decrypt.
+    // Fine at this scale (single user's active grants); revisit with a
+    // deterministic HMAC lookup column if this ever needs to scale further.
+    const rows = this.db.prepare(`SELECT * FROM grants`).all() as Row[];
+    for (const row of rows) {
+      const grant = rowToGrant(row);
+      if (grant.talenoxAccessToken === accessToken) {
+        return grant;
+      }
+    }
+    return null;
+  }
+
+  rotateGrant(oldGrantId: string, newGrantId: string, grant: StoredGrant): void {
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM grants WHERE grant_id = ?`).run(oldGrantId);
+      this.createGrant(newGrantId, grant);
+    });
+    tx();
+  }
+
+  deleteGrant(grantId: string): void {
+    this.db.prepare(`DELETE FROM grants WHERE grant_id = ?`).run(grantId);
   }
 
   close(): void {
@@ -398,7 +448,7 @@ export class TokenStore {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/auth/token-store.test.ts`
-Expected: PASS (4 tests)
+Expected: PASS (5 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -628,48 +678,57 @@ git commit -m "feat(auth): add Talenox OAuth client (authorize/exchange/refresh)
 
 ---
 
-### Task 5: Session manager (proactive refresh wrapper)
+### Task 5: Talenox grant shim (exchange, refresh-translation, verify)
 
 **Files:**
-- Create: `src/auth/session-manager.ts`
-- Test: `tests/auth/session-manager.test.ts`
+- Create: `src/auth/talenox-grant-shim.ts`
+- Test: `tests/auth/talenox-grant-shim.test.ts`
 
 **Interfaces:**
-- Consumes: `TokenStore` (Task 3), `refreshTokens` (Task 4).
+- Consumes: `TokenStore` (Task 3), `exchangeCodeForTokens`/`refreshTokens` (Task 4).
 - Produces:
-  - `class SessionManager { constructor(store: TokenStore, oauthConfig: { clientId: string; clientSecret: string; redirectUri: string }); getValidAccessToken(sessionId: string): Promise<string> }`
-  - `getValidAccessToken` throws `SessionNotFoundError` (exported) if no tokens exist for the session — this is what the MCP layer maps to "reconnect the connector" in Task 8.
-  - Refreshes automatically when `expiresAt` is within 5 minutes (300_000ms) of now, using the injected `now()` for testability (default `Date.now`).
+  - `type IssuedGrant = { accessToken: string; refreshToken: string; expiresIn: number }` — shaped for direct use as an MCP/OAuth token response body.
+  - `class TalenoxGrantShim { constructor(store: TokenStore, oauthConfig: { clientId: string; clientSecret: string; redirectUri: string }, idGenerator?: () => string); exchangeAuthorizationCode(code: string): Promise<IssuedGrant>; refresh(ourRefreshToken: string): Promise<IssuedGrant>; verifyAccessToken(accessToken: string): { valid: true; expiresAt: number } | { valid: false } }`
+  - `idGenerator` defaults to `crypto.randomUUID`, injectable for deterministic tests.
+  - `exchangeAuthorizationCode`: calls Talenox's real authorization_code grant (standard shape, unaffected by the refresh quirk), mints a new opaque grant id, stores `{talenoxAccessToken, talenoxRefreshToken, expiresAt}` under it, returns `{accessToken: <Talenox's real access token>, refreshToken: <our opaque grant id>, expiresIn}`.
+  - `refresh`: looks up the grant by `ourRefreshToken` (our opaque id, not Talenox's real refresh token); if not found, throws `GrantNotFoundError` (exported — Task 7 maps this to an OAuth `invalid_grant` error so the client knows to re-authorize). Otherwise calls Talenox's refresh endpoint using the **stored** `talenoxAccessToken` for the required `code` param and the stored `talenoxRefreshToken`, rotates to a new grant id via `TokenStore.rotateGrant`, and returns the new `{accessToken, refreshToken, expiresIn}` in the same shape.
+  - `verifyAccessToken`: looks up `TokenStore.findGrantByAccessToken`; returns `{valid: false}` if not found or already past `expiresAt`, else `{valid: true, expiresAt}`. This never calls Talenox — it only trusts what this server already knows from the last exchange/refresh, which is correct because refresh is client-driven (Task 7), not proactive.
 
 - [ ] **Step 1: Write the failing test**
 
 ```typescript
-// tests/auth/session-manager.test.ts
+// tests/auth/talenox-grant-shim.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TokenStore } from "../../src/auth/token-store.js";
 import {
-  SessionManager,
-  SessionNotFoundError,
-} from "../../src/auth/session-manager.js";
+  TalenoxGrantShim,
+  GrantNotFoundError,
+} from "../../src/auth/talenox-grant-shim.js";
 import * as talenoxOAuth from "../../src/auth/talenox-oauth-client.js";
 
-describe("SessionManager", () => {
+describe("TalenoxGrantShim", () => {
   let dir: string;
   let store: TokenStore;
-  let manager: SessionManager;
+  let shim: TalenoxGrantShim;
+  let idCounter: number;
 
   beforeEach(() => {
     process.env.MCP_ENCRYPTION_KEY = "0".repeat(63) + "1";
     dir = mkdtempSync(join(tmpdir(), "talenox-mcp-test-"));
     store = new TokenStore(join(dir, "tokens.db"));
-    manager = new SessionManager(store, {
-      clientId: "client-123",
-      clientSecret: "secret-abc",
-      redirectUri: "https://example.com/callback",
-    });
+    idCounter = 0;
+    shim = new TalenoxGrantShim(
+      store,
+      {
+        clientId: "client-123",
+        clientSecret: "secret-abc",
+        redirectUri: "https://example.com/callback",
+      },
+      () => `grant-${++idCounter}`,
+    );
   });
 
   afterEach(() => {
@@ -678,66 +737,116 @@ describe("SessionManager", () => {
     vi.restoreAllMocks();
   });
 
-  it("throws SessionNotFoundError for an unknown session", async () => {
-    await expect(manager.getValidAccessToken("nope")).rejects.toThrow(
-      SessionNotFoundError,
-    );
-  });
-
-  it("returns the stored access token when not near expiry", async () => {
-    store.saveTokens("session-1", {
-      accessToken: "acc-fresh",
-      refreshToken: "ref-1",
-      expiresAt: Date.now() + 20 * 60 * 1000,
-    });
-    const token = await manager.getValidAccessToken("session-1");
-    expect(token).toBe("acc-fresh");
-  });
-
-  it("proactively refreshes when within 5 minutes of expiry, storing the new refresh_token", async () => {
-    store.saveTokens("session-1", {
-      accessToken: "acc-old",
-      refreshToken: "ref-old",
-      expiresAt: Date.now() + 2 * 60 * 1000,
-    });
-    vi.spyOn(talenoxOAuth, "refreshTokens").mockResolvedValue({
-      access_token: "acc-new",
-      refresh_token: "ref-new",
+  it("exchanges an authorization code, minting an opaque grant id as refreshToken", async () => {
+    vi.spyOn(talenoxOAuth, "exchangeCodeForTokens").mockResolvedValue({
+      access_token: "acc-1",
+      refresh_token: "talenox-ref-1",
       expires_in: 1800,
     });
 
-    const token = await manager.getValidAccessToken("session-1");
+    const issued = await shim.exchangeAuthorizationCode("auth-code-xyz");
 
-    expect(token).toBe("acc-new");
-    const stored = store.getTokens("session-1");
-    expect(stored?.accessToken).toBe("acc-new");
-    expect(stored?.refreshToken).toBe("ref-new");
+    expect(issued).toEqual({
+      accessToken: "acc-1",
+      refreshToken: "grant-1",
+      expiresIn: 1800,
+    });
+    expect(store.getGrant("grant-1")).toEqual({
+      talenoxAccessToken: "acc-1",
+      talenoxRefreshToken: "talenox-ref-1",
+      expiresAt: expect.any(Number),
+    });
+  });
+
+  it("refresh looks up the stored access token to build Talenox's required code param, then rotates", async () => {
+    vi.spyOn(talenoxOAuth, "exchangeCodeForTokens").mockResolvedValue({
+      access_token: "acc-1",
+      refresh_token: "talenox-ref-1",
+      expires_in: 1800,
+    });
+    await shim.exchangeAuthorizationCode("auth-code-xyz");
+
+    const refreshSpy = vi
+      .spyOn(talenoxOAuth, "refreshTokens")
+      .mockResolvedValue({
+        access_token: "acc-2",
+        refresh_token: "talenox-ref-2",
+        expires_in: 1800,
+      });
+
+    const issued = await shim.refresh("grant-1");
+
+    expect(refreshSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accessToken: "acc-1", // the stored Talenox access token, not the client's opaque id
+        refreshToken: "talenox-ref-1",
+      }),
+    );
+    expect(issued).toEqual({
+      accessToken: "acc-2",
+      refreshToken: "grant-2",
+      expiresIn: 1800,
+    });
+    expect(store.getGrant("grant-1")).toBeNull(); // old grant id is gone
+    expect(store.getGrant("grant-2")).toEqual({
+      talenoxAccessToken: "acc-2",
+      talenoxRefreshToken: "talenox-ref-2",
+      expiresAt: expect.any(Number),
+    });
+  });
+
+  it("refresh throws GrantNotFoundError for an unknown refresh token", async () => {
+    await expect(shim.refresh("not-a-real-grant")).rejects.toThrow(
+      GrantNotFoundError,
+    );
+  });
+
+  it("verifyAccessToken reports valid for a live grant's access token", async () => {
+    vi.spyOn(talenoxOAuth, "exchangeCodeForTokens").mockResolvedValue({
+      access_token: "acc-1",
+      refresh_token: "talenox-ref-1",
+      expires_in: 1800,
+    });
+    await shim.exchangeAuthorizationCode("auth-code-xyz");
+
+    const result = shim.verifyAccessToken("acc-1");
+    expect(result.valid).toBe(true);
+  });
+
+  it("verifyAccessToken reports invalid for an unknown access token", () => {
+    const result = shim.verifyAccessToken("never-issued");
+    expect(result.valid).toBe(false);
   });
 });
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npx vitest run tests/auth/session-manager.test.ts`
+Run: `npx vitest run tests/auth/talenox-grant-shim.test.ts`
 Expected: FAIL — module not found
 
 - [ ] **Step 3: Write the implementation**
 
 ```typescript
-// src/auth/session-manager.ts
+// src/auth/talenox-grant-shim.ts
+import { randomUUID } from "node:crypto";
 import type { TokenStore } from "./token-store.js";
-import { refreshTokens } from "./talenox-oauth-client.js";
+import { exchangeCodeForTokens, refreshTokens } from "./talenox-oauth-client.js";
 
-export class SessionNotFoundError extends Error {
-  constructor(sessionId: string) {
-    super(`No stored tokens for session ${sessionId}`);
-    this.name = "SessionNotFoundError";
+export type IssuedGrant = {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+};
+
+export class GrantNotFoundError extends Error {
+  constructor(grantId: string) {
+    super(`No stored grant for refresh token ${grantId}`);
+    this.name = "GrantNotFoundError";
   }
 }
 
-const REFRESH_MARGIN_MS = 5 * 60 * 1000;
-
-export class SessionManager {
+export class TalenoxGrantShim {
   constructor(
     private store: TokenStore,
     private oauthConfig: {
@@ -745,47 +854,83 @@ export class SessionManager {
       clientSecret: string;
       redirectUri: string;
     },
+    private idGenerator: () => string = randomUUID,
   ) {}
 
-  async getValidAccessToken(sessionId: string): Promise<string> {
-    const tokens = this.store.getTokens(sessionId);
-    if (!tokens) {
-      throw new SessionNotFoundError(sessionId);
-    }
+  async exchangeAuthorizationCode(code: string): Promise<IssuedGrant> {
+    const tokens = await exchangeCodeForTokens({
+      clientId: this.oauthConfig.clientId,
+      clientSecret: this.oauthConfig.clientSecret,
+      redirectUri: this.oauthConfig.redirectUri,
+      code,
+    });
 
-    if (tokens.expiresAt - Date.now() > REFRESH_MARGIN_MS) {
-      return tokens.accessToken;
+    const grantId = this.idGenerator();
+    const expiresAt = Date.now() + tokens.expires_in * 1000;
+
+    this.store.createGrant(grantId, {
+      talenoxAccessToken: tokens.access_token,
+      talenoxRefreshToken: tokens.refresh_token,
+      expiresAt,
+    });
+
+    return {
+      accessToken: tokens.access_token,
+      refreshToken: grantId,
+      expiresIn: tokens.expires_in,
+    };
+  }
+
+  async refresh(ourRefreshToken: string): Promise<IssuedGrant> {
+    const grant = this.store.getGrant(ourRefreshToken);
+    if (!grant) {
+      throw new GrantNotFoundError(ourRefreshToken);
     }
 
     const refreshed = await refreshTokens({
       clientId: this.oauthConfig.clientId,
       clientSecret: this.oauthConfig.clientSecret,
       redirectUri: this.oauthConfig.redirectUri,
-      refreshToken: tokens.refreshToken,
-      accessToken: tokens.accessToken,
+      refreshToken: grant.talenoxRefreshToken,
+      accessToken: grant.talenoxAccessToken,
     });
 
-    this.store.saveTokens(sessionId, {
+    const newGrantId = this.idGenerator();
+    const expiresAt = Date.now() + refreshed.expires_in * 1000;
+
+    this.store.rotateGrant(ourRefreshToken, newGrantId, {
+      talenoxAccessToken: refreshed.access_token,
+      talenoxRefreshToken: refreshed.refresh_token,
+      expiresAt,
+    });
+
+    return {
       accessToken: refreshed.access_token,
-      refreshToken: refreshed.refresh_token,
-      expiresAt: Date.now() + refreshed.expires_in * 1000,
-    });
+      refreshToken: newGrantId,
+      expiresIn: refreshed.expires_in,
+    };
+  }
 
-    return refreshed.access_token;
+  verifyAccessToken(accessToken: string): { valid: true; expiresAt: number } | { valid: false } {
+    const grant = this.store.findGrantByAccessToken(accessToken);
+    if (!grant || grant.expiresAt <= Date.now()) {
+      return { valid: false };
+    }
+    return { valid: true, expiresAt: grant.expiresAt };
   }
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `npx vitest run tests/auth/session-manager.test.ts`
-Expected: PASS (3 tests)
+Run: `npx vitest run tests/auth/talenox-grant-shim.test.ts`
+Expected: PASS (5 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/auth/session-manager.ts tests/auth/session-manager.test.ts
-git commit -m "feat(auth): add SessionManager with proactive token refresh"
+git add src/auth/talenox-grant-shim.ts tests/auth/talenox-grant-shim.test.ts
+git commit -m "feat(auth): add Talenox grant shim (exchange/refresh-translation/verify)"
 ```
 
 ---
@@ -972,53 +1117,143 @@ git commit -m "feat(talenox): add API client with bearer auth and error mapping"
 
 ---
 
-### Task 7: OAuth authorization server routes (Express)
+### Task 7: Talenox OAuth provider (PKCE + dynamic client registration via SDK)
 
 **Files:**
-- Create: `src/auth/oauth-routes.ts`
-- Test: `tests/auth/oauth-routes.test.ts`
+- Create: `src/auth/pending-authorizations.ts`
+- Create: `src/auth/oauth-provider.ts`
+- Test: `tests/auth/pending-authorizations.test.ts`
+- Test: `tests/auth/oauth-provider.test.ts`
 
 **Interfaces:**
-- Consumes: `TokenStore` (Task 3), `buildAuthorizeUrl`/`exchangeCodeForTokens` (Task 4).
-- Produces: `function createOAuthRouter(config: { publicBaseUrl: string; talenoxClientId: string; talenoxClientSecret: string; scope: string; store: TokenStore }): express.Router` mounting:
-  - `GET /.well-known/oauth-authorization-server` — returns `{ issuer: publicBaseUrl, authorization_endpoint: \`${publicBaseUrl}/authorize\`, token_endpoint: \`${publicBaseUrl}/token\` }`
-  - `GET /authorize` — generates a random session id, stashes it in the OAuth `state` param (prefixed, e.g. `state=<clientState>::<sessionId>`), redirects to Talenox's authorize URL via `buildAuthorizeUrl`.
-  - `GET /callback` — reads `code` and `state` from Talenox's redirect, splits the session id back out of `state`, exchanges the code via `exchangeCodeForTokens`, saves tokens in the store under that session id, then returns a minted MCP session token (for v1: the session id itself, returned as `{ session_token: sessionId }` in the response body — the MCP layer in Task 8 treats this as the bearer token clients must send).
-  - `GET /health` — unauthenticated, returns `{ status: "ok" }`.
+- Consumes: `TalenoxGrantShim`/`GrantNotFoundError` (Task 5), `buildAuthorizeUrl` (Task 4).
+- Produces:
+  - `class PendingAuthorizations { constructor(ttlMs?: number, idGenerator?: () => string); create(payload: unknown): string; consume(id: string): unknown | null }` — in-memory, TTL-expiring (default 5 minutes), single-use (`consume` deletes on read). Ephemeral by design: a lost in-flight authorization just means the user retries login — no durability requirement, unlike the grant store.
+  - `function createTalenoxOAuthProvider(config: { publicBaseUrl: string; talenoxClientId: string; talenoxClientSecret: string; scope: string; shim: TalenoxGrantShim }): { provider: OAuthServerProviderShape; callbackHandler: express.RequestHandler }`. The returned `provider` object matches the SDK's `OAuthServerProvider` interface (see implementer note below) with:
+    - `clientsStore` — minimal in-memory `getClient`/`registerClient` (dynamic client registration; ephemeral across restarts, acceptable since claude.ai re-registers automatically on reconnect, same tradeoff as `PendingAuthorizations`).
+    - `authorize(client, params, res)` — stores `{ clientRedirectUri, clientState, codeChallenge, codeChallengeMethod }` in a `PendingAuthorizations` instance (the "handoff"), redirects `res` to Talenox's real authorize URL with `state` set to the handoff id.
+    - The `callbackHandler` (mounted separately at `/callback`, NOT part of the SDK's router — this is Talenox's redirect target, registered as the app's Redirect URI in the Talenox developer console): reads Talenox's `code`/`state`, looks up the handoff by `state`, immediately calls `shim.exchangeAuthorizationCode(code)`, mints a second, final single-use MCP authorization code via a second `PendingAuthorizations` instance carrying `{ accessToken, refreshToken, expiresIn, codeChallenge, codeChallengeMethod }`, and redirects the browser to `clientRedirectUri` with that new code + the original `clientState`.
+    - `challengeForAuthorizationCode(client, code)` — looks up the final pending entry by `code` (without consuming), returns its `codeChallenge`/`codeChallengeMethod` so the SDK's router can verify the client's PKCE `code_verifier`.
+    - `exchangeAuthorizationCode(client, code)` — consumes the final pending entry, returns `{ access_token, refresh_token, expires_in }` from the values already fetched at callback time (no second Talenox call).
+    - `exchangeRefreshToken(client, refreshToken)` — calls `shim.refresh(refreshToken)`, maps `GrantNotFoundError` to whatever invalid-grant error the installed SDK expects (verify exact class/shape — see implementer note).
+    - `verifyAccessToken(token)` — calls `shim.verifyAccessToken(token)`; on `{valid:false}` throws/returns the SDK's expected "invalid token" signal (verify exact contract — see implementer note); on valid, returns an `AuthInfo`-shaped object `{ token, clientId: "talenox-mcp-client", scopes: [config.scope], expiresAt: Math.floor(grant.expiresAt / 1000) }`.
 
-- [ ] **Step 1: Write the failing test**
+**Note for implementer:** the exact method names/signatures of `OAuthServerProvider` (from `@modelcontextprotocol/sdk/server/auth/provider.js`) and the shape of `AuthInfo`/error classes it expects are SDK-version-sensitive — same caveat already flagged for `McpServer`/`StreamableHTTPServerTransport` in Tasks 9 and 12. Before writing this task, read `node_modules/@modelcontextprotocol/sdk/dist/esm/server/auth/provider.js` (or its `.d.ts`) and `.../router.js` in the installed version and adjust method names/signatures to match exactly. The structural decision to preserve regardless of exact SDK shape: a custom (non-Proxy) `OAuthServerProvider` implementation is required — NOT `ProxyOAuthServerProvider` — because Talenox's refresh grant is nonstandard (needs the extra `code=<access_token>` param) and a transparent proxy cannot express that translation.
+
+- [ ] **Step 1: Write the failing test for `PendingAuthorizations`**
 
 ```typescript
-// tests/auth/oauth-routes.test.ts
+// tests/auth/pending-authorizations.test.ts
+import { describe, it, expect } from "vitest";
+import { PendingAuthorizations } from "../../src/auth/pending-authorizations.js";
+
+describe("PendingAuthorizations", () => {
+  it("creates and consumes a payload exactly once", () => {
+    const pending = new PendingAuthorizations(5 * 60 * 1000, () => "id-1");
+    const id = pending.create({ foo: "bar" });
+    expect(id).toBe("id-1");
+    expect(pending.consume(id)).toEqual({ foo: "bar" });
+    expect(pending.consume(id)).toBeNull();
+  });
+
+  it("returns null for an unknown id", () => {
+    const pending = new PendingAuthorizations();
+    expect(pending.consume("nope")).toBeNull();
+  });
+
+  it("expires an entry after the TTL", async () => {
+    const pending = new PendingAuthorizations(10, () => "id-1"); // 10ms TTL
+    const id = pending.create({ foo: "bar" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(pending.consume(id)).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run tests/auth/pending-authorizations.test.ts`
+Expected: FAIL — module not found
+
+- [ ] **Step 3: Write `src/auth/pending-authorizations.ts`**
+
+```typescript
+// src/auth/pending-authorizations.ts
+import { randomUUID } from "node:crypto";
+
+type Entry = { payload: unknown; expiresAt: number };
+
+const DEFAULT_TTL_MS = 5 * 60 * 1000;
+
+export class PendingAuthorizations {
+  private entries = new Map<string, Entry>();
+
+  constructor(
+    private ttlMs: number = DEFAULT_TTL_MS,
+    private idGenerator: () => string = randomUUID,
+  ) {}
+
+  create(payload: unknown): string {
+    const id = this.idGenerator();
+    this.entries.set(id, { payload, expiresAt: Date.now() + this.ttlMs });
+    return id;
+  }
+
+  consume(id: string): unknown | null {
+    const entry = this.entries.get(id);
+    if (!entry) return null;
+    this.entries.delete(id);
+    if (entry.expiresAt <= Date.now()) return null;
+    return entry.payload;
+  }
+
+  peek(id: string): unknown | null {
+    const entry = this.entries.get(id);
+    if (!entry || entry.expiresAt <= Date.now()) return null;
+    return entry.payload;
+  }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run tests/auth/pending-authorizations.test.ts`
+Expected: PASS (3 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/auth/pending-authorizations.ts tests/auth/pending-authorizations.test.ts
+git commit -m "feat(auth): add TTL-based single-use pending authorization store"
+```
+
+- [ ] **Step 6: Write the failing test for the OAuth provider**
+
+```typescript
+// tests/auth/oauth-provider.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import express from "express";
-import request from "supertest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TokenStore } from "../../src/auth/token-store.js";
-import { createOAuthRouter } from "../../src/auth/oauth-routes.js";
+import { TalenoxGrantShim } from "../../src/auth/talenox-grant-shim.js";
+import { createTalenoxOAuthProvider } from "../../src/auth/oauth-provider.js";
 import * as talenoxOAuth from "../../src/auth/talenox-oauth-client.js";
 
-describe("OAuth routes", () => {
+describe("createTalenoxOAuthProvider", () => {
   let dir: string;
   let store: TokenStore;
-  let app: express.Express;
+  let shim: TalenoxGrantShim;
 
   beforeEach(() => {
     process.env.MCP_ENCRYPTION_KEY = "0".repeat(63) + "1";
     dir = mkdtempSync(join(tmpdir(), "talenox-mcp-test-"));
     store = new TokenStore(join(dir, "tokens.db"));
-    app = express();
-    app.use(
-      createOAuthRouter({
-        publicBaseUrl: "https://example.onrender.com",
-        talenoxClientId: "client-123",
-        talenoxClientSecret: "secret-abc",
-        scope: "payroll",
-        store,
-      }),
-    );
+    shim = new TalenoxGrantShim(store, {
+      clientId: "client-123",
+      clientSecret: "secret-abc",
+      redirectUri: "https://example.onrender.com/callback",
+    });
   });
 
   afterEach(() => {
@@ -1027,155 +1262,290 @@ describe("OAuth routes", () => {
     vi.restoreAllMocks();
   });
 
-  it("serves OAuth metadata with the public base URL as issuer", async () => {
-    const res = await request(app).get(
-      "/.well-known/oauth-authorization-server",
-    );
-    expect(res.status).toBe(200);
-    expect(res.body.issuer).toBe("https://example.onrender.com");
-    expect(res.body.authorization_endpoint).toBe(
-      "https://example.onrender.com/authorize",
-    );
-  });
+  it("redirects authorize() to Talenox's real authorize URL", async () => {
+    const { provider } = createTalenoxOAuthProvider({
+      publicBaseUrl: "https://example.onrender.com",
+      talenoxClientId: "client-123",
+      talenoxClientSecret: "secret-abc",
+      scope: "payroll",
+      shim,
+    });
 
-  it("redirects /authorize to Talenox with a session-tagged state", async () => {
-    const res = await request(app).get("/authorize?state=client-state-1");
-    expect(res.status).toBe(302);
-    const location = new URL(res.headers.location);
+    const redirectSpy = vi.fn();
+    const fakeRes = { redirect: redirectSpy } as any;
+
+    await provider.authorize(
+      { client_id: "mcp-client-1" } as any,
+      {
+        redirectUri: "https://claude.ai/oauth/callback",
+        state: "client-state-1",
+        codeChallenge: "challenge-abc",
+      } as any,
+      fakeRes,
+    );
+
+    expect(redirectSpy).toHaveBeenCalledTimes(1);
+    const location = new URL(redirectSpy.mock.calls[0][0]);
     expect(location.origin + location.pathname).toBe(
       "https://app.talenox.com/oauth/authorize",
     );
-    expect(location.searchParams.get("state")).toContain("client-state-1::");
   });
 
-  it("exchanges the code on /callback and stores tokens", async () => {
+  it("runs the full authorize -> callback -> exchange -> refresh cycle", async () => {
     vi.spyOn(talenoxOAuth, "exchangeCodeForTokens").mockResolvedValue({
       access_token: "acc-1",
-      refresh_token: "ref-1",
+      refresh_token: "talenox-ref-1",
       expires_in: 1800,
     });
 
-    const authRes = await request(app).get("/authorize?state=client-state-1");
-    const state = new URL(authRes.headers.location).searchParams.get(
-      "state",
-    )!;
-    const sessionId = state.split("::")[1];
-
-    const callbackRes = await request(app)
-      .get("/callback")
-      .query({ code: "auth-code-xyz", state });
-
-    expect(callbackRes.status).toBe(200);
-    expect(callbackRes.body.session_token).toBe(sessionId);
-    expect(store.getTokens(sessionId)).toEqual({
-      accessToken: "acc-1",
-      refreshToken: "ref-1",
-      expiresAt: expect.any(Number),
+    const { provider, callbackHandler } = createTalenoxOAuthProvider({
+      publicBaseUrl: "https://example.onrender.com",
+      talenoxClientId: "client-123",
+      talenoxClientSecret: "secret-abc",
+      scope: "payroll",
+      shim,
     });
+
+    let talenoxRedirectUrl = "";
+    await provider.authorize(
+      { client_id: "mcp-client-1" } as any,
+      {
+        redirectUri: "https://claude.ai/oauth/callback",
+        state: "client-state-1",
+        codeChallenge: "challenge-abc",
+      } as any,
+      { redirect: (url: string) => (talenoxRedirectUrl = url) } as any,
+    );
+    const handoffState = new URL(talenoxRedirectUrl).searchParams.get("state")!;
+
+    let finalRedirectUrl = "";
+    const fakeReq = {
+      query: { code: "talenox-auth-code", state: handoffState },
+    } as any;
+    const fakeRes = { redirect: (url: string) => (finalRedirectUrl = url) } as any;
+    await callbackHandler(fakeReq, fakeRes, () => {});
+
+    const finalUrl = new URL(finalRedirectUrl);
+    expect(finalUrl.origin + finalUrl.pathname).toBe(
+      "https://claude.ai/oauth/callback",
+    );
+    expect(finalUrl.searchParams.get("state")).toBe("client-state-1");
+    const mcpAuthCode = finalUrl.searchParams.get("code")!;
+
+    const challenge = await provider.challengeForAuthorizationCode(
+      { client_id: "mcp-client-1" } as any,
+      mcpAuthCode,
+    );
+    expect(challenge).toBe("challenge-abc");
+
+    const tokens = await provider.exchangeAuthorizationCode(
+      { client_id: "mcp-client-1" } as any,
+      mcpAuthCode,
+    );
+    expect(tokens.access_token).toBe("acc-1");
+    expect(tokens.refresh_token).toBeTruthy();
+
+    vi.spyOn(talenoxOAuth, "refreshTokens").mockResolvedValue({
+      access_token: "acc-2",
+      refresh_token: "talenox-ref-2",
+      expires_in: 1800,
+    });
+    const refreshed = await provider.exchangeRefreshToken(
+      { client_id: "mcp-client-1" } as any,
+      tokens.refresh_token,
+    );
+    expect(refreshed.access_token).toBe("acc-2");
   });
 
-  it("serves an unauthenticated health check", async () => {
-    const res = await request(app).get("/health");
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ status: "ok" });
+  it("verifyAccessToken resolves valid tokens and rejects unknown ones", async () => {
+    vi.spyOn(talenoxOAuth, "exchangeCodeForTokens").mockResolvedValue({
+      access_token: "acc-1",
+      refresh_token: "talenox-ref-1",
+      expires_in: 1800,
+    });
+    const { provider } = createTalenoxOAuthProvider({
+      publicBaseUrl: "https://example.onrender.com",
+      talenoxClientId: "client-123",
+      talenoxClientSecret: "secret-abc",
+      scope: "payroll",
+      shim,
+    });
+    await shim.exchangeAuthorizationCode("talenox-auth-code");
+
+    const info = await provider.verifyAccessToken("acc-1");
+    expect(info.token).toBe("acc-1");
+
+    await expect(provider.verifyAccessToken("never-issued")).rejects.toThrow();
   });
 });
 ```
 
-- [ ] **Step 2: Install test-only dependency and run test to verify it fails**
+**Note for implementer:** adjust the exact shapes passed to `provider.authorize`/`challengeForAuthorizationCode`/`exchangeAuthorizationCode`/`exchangeRefreshToken`/`verifyAccessToken` in this test to match the installed SDK's real `OAuthServerProvider` interface (see the Interfaces section's implementer note) — the test's job is to prove the *behavior* (redirect to Talenox, full round-trip, PKCE challenge survives the two-hop redirect, verify accepts/rejects correctly), not to lock in exact SDK argument names if they differ by version.
 
-Run: `npm install --save-dev supertest @types/supertest && npx vitest run tests/auth/oauth-routes.test.ts`
+- [ ] **Step 7: Run test to verify it fails**
+
+Run: `npx vitest run tests/auth/oauth-provider.test.ts`
 Expected: FAIL — module not found
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 8: Write `src/auth/oauth-provider.ts`**
 
 ```typescript
-// src/auth/oauth-routes.ts
-import { Router } from "express";
-import { randomUUID } from "node:crypto";
-import type { TokenStore } from "./token-store.js";
-import {
-  buildAuthorizeUrl,
-  exchangeCodeForTokens,
-} from "./talenox-oauth-client.js";
+// src/auth/oauth-provider.ts
+import type { Request, Response, NextFunction } from "express";
+import { buildAuthorizeUrl } from "./talenox-oauth-client.js";
+import { TalenoxGrantShim, GrantNotFoundError } from "./talenox-grant-shim.js";
+import { PendingAuthorizations } from "./pending-authorizations.js";
 
-export function createOAuthRouter(config: {
+type HandoffPayload = {
+  clientRedirectUri: string;
+  clientState: string;
+  codeChallenge: string;
+};
+
+type FinalCodePayload = {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  codeChallenge: string;
+};
+
+export function createTalenoxOAuthProvider(config: {
   publicBaseUrl: string;
   talenoxClientId: string;
   talenoxClientSecret: string;
   scope: string;
-  store: TokenStore;
-}): Router {
-  const router = Router();
+  shim: TalenoxGrantShim;
+}) {
   const redirectUri = `${config.publicBaseUrl}/callback`;
+  const handoffs = new PendingAuthorizations();
+  const finalCodes = new PendingAuthorizations();
+  const registeredClients = new Map<string, unknown>();
 
-  router.get("/health", (_req, res) => {
-    res.json({ status: "ok" });
-  });
+  const clientsStore = {
+    async getClient(clientId: string) {
+      return registeredClients.get(clientId);
+    },
+    async registerClient(client: { client_id: string }) {
+      registeredClients.set(client.client_id, client);
+      return client;
+    },
+  };
 
-  router.get("/.well-known/oauth-authorization-server", (_req, res) => {
-    res.json({
-      issuer: config.publicBaseUrl,
-      authorization_endpoint: `${config.publicBaseUrl}/authorize`,
-      token_endpoint: `${config.publicBaseUrl}/token`,
-    });
-  });
-
-  router.get("/authorize", (req, res) => {
-    const clientState = String(req.query.state ?? "");
-    const sessionId = randomUUID();
-    const combinedState = `${clientState}::${sessionId}`;
+  async function authorize(
+    _client: unknown,
+    params: { redirectUri: string; state: string; codeChallenge: string },
+    res: Response,
+  ) {
+    const handoffId = handoffs.create({
+      clientRedirectUri: params.redirectUri,
+      clientState: params.state,
+      codeChallenge: params.codeChallenge,
+    } satisfies HandoffPayload);
 
     const url = buildAuthorizeUrl({
       clientId: config.talenoxClientId,
       redirectUri,
       scope: config.scope,
-      state: combinedState,
+      state: handoffId,
     });
 
     res.redirect(url);
-  });
+  }
 
-  router.get("/callback", async (req, res) => {
+  const callbackHandler = async (req: Request, res: Response, _next: NextFunction) => {
     const code = String(req.query.code ?? "");
-    const state = String(req.query.state ?? "");
-    const sessionId = state.split("::")[1];
+    const handoffId = String(req.query.state ?? "");
+    const handoff = handoffs.consume(handoffId) as HandoffPayload | null;
 
-    if (!code || !sessionId) {
-      res.status(400).json({ error: "missing code or state" });
+    if (!code || !handoff) {
+      res.status(400).json({ error: "invalid or expired authorization handoff" });
       return;
     }
 
-    const tokens = await exchangeCodeForTokens({
-      clientId: config.talenoxClientId,
-      clientSecret: config.talenoxClientSecret,
-      redirectUri,
-      code,
-    });
+    const issued = await config.shim.exchangeAuthorizationCode(code);
 
-    config.store.saveTokens(sessionId, {
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
-      expiresAt: Date.now() + tokens.expires_in * 1000,
-    });
+    const mcpAuthCode = finalCodes.create({
+      accessToken: issued.accessToken,
+      refreshToken: issued.refreshToken,
+      expiresIn: issued.expiresIn,
+      codeChallenge: handoff.codeChallenge,
+    } satisfies FinalCodePayload);
 
-    res.json({ session_token: sessionId });
-  });
+    const redirectUrl = new URL(handoff.clientRedirectUri);
+    redirectUrl.searchParams.set("code", mcpAuthCode);
+    redirectUrl.searchParams.set("state", handoff.clientState);
+    res.redirect(redirectUrl.toString());
+  };
 
-  return router;
+  async function challengeForAuthorizationCode(_client: unknown, code: string) {
+    const entry = finalCodes.peek(code) as FinalCodePayload | null;
+    if (!entry) throw new Error("unknown or expired authorization code");
+    return entry.codeChallenge;
+  }
+
+  async function exchangeAuthorizationCode(_client: unknown, code: string) {
+    const entry = finalCodes.consume(code) as FinalCodePayload | null;
+    if (!entry) throw new Error("unknown or expired authorization code");
+    return {
+      access_token: entry.accessToken,
+      refresh_token: entry.refreshToken,
+      expires_in: entry.expiresIn,
+    };
+  }
+
+  async function exchangeRefreshToken(_client: unknown, refreshToken: string) {
+    try {
+      const issued = await config.shim.refresh(refreshToken);
+      return {
+        access_token: issued.accessToken,
+        refresh_token: issued.refreshToken,
+        expires_in: issued.expiresIn,
+      };
+    } catch (err) {
+      if (err instanceof GrantNotFoundError) {
+        throw new Error("invalid_grant"); // TODO(implementer): map to the SDK's expected invalid-grant error type
+      }
+      throw err;
+    }
+  }
+
+  async function verifyAccessToken(token: string) {
+    const result = config.shim.verifyAccessToken(token);
+    if (!result.valid) {
+      throw new Error("invalid_token"); // TODO(implementer): map to the SDK's expected invalid-token error type
+    }
+    return {
+      token,
+      clientId: "talenox-mcp-client",
+      scopes: [config.scope],
+      expiresAt: Math.floor(result.expiresAt / 1000),
+    };
+  }
+
+  return {
+    provider: {
+      clientsStore,
+      authorize,
+      challengeForAuthorizationCode,
+      exchangeAuthorizationCode,
+      exchangeRefreshToken,
+      verifyAccessToken,
+    },
+    callbackHandler,
+  };
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 9: Run test to verify it passes**
 
-Run: `npx vitest run tests/auth/oauth-routes.test.ts`
-Expected: PASS (4 tests)
+Run: `npx vitest run tests/auth/oauth-provider.test.ts`
+Expected: PASS (3 tests)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add src/auth/oauth-routes.ts tests/auth/oauth-routes.test.ts package.json package-lock.json
-git commit -m "feat(auth): add OAuth authorization server routes"
+git add src/auth/oauth-provider.ts tests/auth/oauth-provider.test.ts
+git commit -m "feat(auth): add Talenox OAuth provider (PKCE handoff + refresh translation)"
 ```
 
 ---
@@ -1188,8 +1558,10 @@ git commit -m "feat(auth): add OAuth authorization server routes"
 - Test: `tests/mcp-server.test.ts`
 
 **Interfaces:**
-- Consumes: `createOAuthRouter` (Task 7), `SessionManager`/`SessionNotFoundError` (Task 5), `TokenStore` (Task 3).
-- Produces: `function createApp(config: { publicBaseUrl: string; talenoxClientId: string; talenoxClientSecret: string; scope: string; store: TokenStore }): express.Express` — mounts the OAuth router and a `POST /mcp` endpoint. The `/mcp` endpoint reads `Authorization: Bearer <sessionId>`, resolves a `TalenoxClient` for the request via `SessionManager.getValidAccessToken`, attaches it to `req.talenoxClient`, and returns `401 { error: "reconnect" }` if `SessionNotFoundError` is thrown. Actual MCP request handling (tool dispatch) is wired in Task 12 once tools exist — this task stubs the MCP transport with no tools registered yet, so the plumbing is provably correct before tools are layered on.
+- Consumes: `createTalenoxOAuthProvider` (Task 7), `TalenoxGrantShim` (Task 5), `TokenStore` (Task 3).
+- Produces: `function createApp(config: { publicBaseUrl: string; talenoxClientId: string; talenoxClientSecret: string; scope: string; store: TokenStore }): express.Express` — mounts `@modelcontextprotocol/sdk`'s `mcpAuthRouter` (using the Task 7 provider) for `/authorize`, `/token`, `/register`, and `/.well-known/oauth-authorization-server`; mounts the Task 7 `callbackHandler` at `GET /callback` directly (not part of `mcpAuthRouter` — this is Talenox's redirect target); mounts `GET /health` (unauthenticated, `{status:"ok"}`); and a `POST /mcp` endpoint gated by the SDK's bearer-auth middleware (built from the same provider's `verifyAccessToken`), which attaches the verified token to the request so tool handlers can construct a `TalenoxClient` from it. Actual MCP tool dispatch is wired in Task 12 once tools exist — this task proves the auth plumbing (401 on bad/missing token, 200 with a resolved identity on a valid one) before tools are layered on.
+
+**Note for implementer:** the SDK exposes bearer-auth enforcement as middleware (commonly `requireBearerAuth` from `@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js` in versions seen during this plan's research) that wraps a provider's `verifyAccessToken` and attaches the result to `req.auth`. Verify the exact import path and attached-property name against the installed SDK version and adjust Step 3 accordingly — same category of caveat as Task 7's provider shape.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1227,36 +1599,49 @@ describe("createApp", () => {
     vi.restoreAllMocks();
   });
 
-  it("returns 401 with a reconnect error for an unknown session on /mcp", async () => {
-    const res = await request(app)
-      .post("/mcp")
-      .set("Authorization", "Bearer unknown-session")
-      .send({});
+  it("returns 401 for an unauthenticated /mcp request", async () => {
+    const res = await request(app).post("/mcp").send({});
     expect(res.status).toBe(401);
-    expect(res.body).toEqual({ error: "reconnect" });
   });
 
-  it("still serves /health from the mounted OAuth router", async () => {
+  it("returns 401 for a bogus bearer token on /mcp", async () => {
+    const res = await request(app)
+      .post("/mcp")
+      .set("Authorization", "Bearer not-a-real-token")
+      .send({});
+    expect(res.status).toBe(401);
+  });
+
+  it("still serves /health unauthenticated", async () => {
     const res = await request(app).get("/health");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: "ok" });
+  });
+
+  it("serves OAuth metadata at the well-known endpoint", async () => {
+    const res = await request(app).get(
+      "/.well-known/oauth-authorization-server",
+    );
     expect(res.status).toBe(200);
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Install `supertest` and run the test to verify it fails**
 
-Run: `npx vitest run tests/mcp-server.test.ts`
+Run: `npm install --save-dev supertest @types/supertest && npx vitest run tests/mcp-server.test.ts`
 Expected: FAIL — module not found
 
 - [ ] **Step 3: Write `src/mcp-server.ts`**
 
 ```typescript
 // src/mcp-server.ts
-import express, { type Express, type Request, type Response, type NextFunction } from "express";
-import { createOAuthRouter } from "./auth/oauth-routes.js";
-import { SessionManager, SessionNotFoundError } from "./auth/session-manager.js";
+import express, { type Express } from "express";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { createTalenoxOAuthProvider } from "./auth/oauth-provider.js";
+import { TalenoxGrantShim } from "./auth/talenox-grant-shim.js";
 import type { TokenStore } from "./auth/token-store.js";
-import { TalenoxClient } from "./talenox/client.js";
 
 export type AppConfig = {
   publicBaseUrl: string;
@@ -1266,58 +1651,47 @@ export type AppConfig = {
   store: TokenStore;
 };
 
-declare module "express-serve-static-core" {
-  interface Request {
-    talenoxClient?: TalenoxClient;
-  }
-}
-
 export function createApp(config: AppConfig): Express {
   const app = express();
   app.use(express.json());
 
-  app.use(
-    createOAuthRouter({
-      publicBaseUrl: config.publicBaseUrl,
-      talenoxClientId: config.talenoxClientId,
-      talenoxClientSecret: config.talenoxClientSecret,
-      scope: config.scope,
-      store: config.store,
-    }),
-  );
+  app.get("/health", (_req, res) => {
+    res.json({ status: "ok" });
+  });
 
-  const sessionManager = new SessionManager(config.store, {
+  const shim = new TalenoxGrantShim(config.store, {
     clientId: config.talenoxClientId,
     clientSecret: config.talenoxClientSecret,
     redirectUri: `${config.publicBaseUrl}/callback`,
   });
 
-  async function attachTalenoxClient(
-    req: Request,
-    res: Response,
-    next: NextFunction,
-  ) {
-    const authHeader = req.header("authorization") ?? "";
-    const sessionId = authHeader.replace(/^Bearer\s+/i, "");
-
-    try {
-      const accessToken = await sessionManager.getValidAccessToken(sessionId);
-      req.talenoxClient = new TalenoxClient(accessToken);
-      next();
-    } catch (err) {
-      if (err instanceof SessionNotFoundError) {
-        res.status(401).json({ error: "reconnect" });
-        return;
-      }
-      next(err);
-    }
-  }
-
-  app.post("/mcp", attachTalenoxClient, (req, res) => {
-    // Tool dispatch is wired in Task 12 once the MCP transport and tool
-    // registry exist. For now, a resolved req.talenoxClient proves auth works.
-    res.json({ status: "authenticated", ready: Boolean(req.talenoxClient) });
+  const { provider, callbackHandler } = createTalenoxOAuthProvider({
+    publicBaseUrl: config.publicBaseUrl,
+    talenoxClientId: config.talenoxClientId,
+    talenoxClientSecret: config.talenoxClientSecret,
+    scope: config.scope,
+    shim,
   });
+
+  app.get("/callback", callbackHandler);
+
+  app.use(
+    mcpAuthRouter({
+      provider: provider as any, // see Task 7/8 implementer notes on exact provider typing
+      issuerUrl: new URL(config.publicBaseUrl),
+      baseUrl: new URL(config.publicBaseUrl),
+    }),
+  );
+
+  app.post(
+    "/mcp",
+    requireBearerAuth({ provider: provider as any }),
+    (_req, res) => {
+      // Tool dispatch is wired in Task 12 once the MCP transport and tool
+      // registry exist. Reaching this point at all proves auth succeeded.
+      res.json({ status: "authenticated" });
+    },
+  );
 
   return app;
 }
@@ -1326,7 +1700,7 @@ export function createApp(config: AppConfig): Express {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/mcp-server.test.ts`
-Expected: PASS (2 tests)
+Expected: PASS (4 tests) — if import paths for `mcpAuthRouter`/`requireBearerAuth` don't match the installed SDK version, fix them per the Task 7/8 implementer notes before re-running.
 
 - [ ] **Step 5: Wire up `src/index.ts`**
 
@@ -1376,8 +1750,8 @@ Expected: prints `talenox-mcp listening on :3000`. Stop with Ctrl-C.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/mcp-server.ts src/index.ts tests/mcp-server.test.ts
-git commit -m "feat(server): wire OAuth routes and authenticated /mcp endpoint"
+git add src/mcp-server.ts src/index.ts tests/mcp-server.test.ts package.json package-lock.json
+git commit -m "feat(server): wire SDK OAuth router, Talenox callback, and authenticated /mcp endpoint"
 ```
 
 ---
@@ -1978,7 +2352,7 @@ git commit -m "feat(tools): add payroll payment/process/publish/payslip tools wi
 
 **Interfaces:**
 - Consumes: all `register*Tools` functions from Tasks 9-11.
-- Produces: `function registerAllTools(server: McpServer, getContext: (extra: unknown) => ToolContext): void` calling every register function. `createApp`'s `/mcp` handler now constructs an `McpServer`, calls `registerAllTools` with a context getter that returns `{ talenox: req.talenoxClient! }`, and connects a `StreamableHTTPServerTransport` per request per the MCP SDK's stateless-HTTP pattern, forwarding the Express request/response into `transport.handleRequest`.
+- Produces: `function registerAllTools(server: McpServer, getContext: (extra: unknown) => ToolContext): void` calling every register function. `createApp`'s `/mcp` handler now constructs an `McpServer`, calls `registerAllTools` with a context getter that builds a `TalenoxClient` from the bearer token `requireBearerAuth` (Task 8) attached to the request — Talenox's real access token passes through as the MCP bearer token (see Task 7's design), so it can be used directly, with no store lookup needed at request time — and connects a `StreamableHTTPServerTransport` per request per the MCP SDK's stateless-HTTP pattern, forwarding the Express request/response into `transport.handleRequest`.
 
 - [ ] **Step 1: Write the failing test for the registry**
 
@@ -2066,37 +2440,48 @@ Expected: PASS (1 test)
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { registerAllTools } from "./tools/index.js";
+import { TalenoxClient } from "./talenox/client.js";
 
-// ... (keep everything above attachTalenoxClient from Task 8 unchanged)
+// ... (keep everything above the /mcp route from Task 8 unchanged, including
+// the requireBearerAuth(...) middleware already applied there)
 
-  app.post("/mcp", attachTalenoxClient, async (req, res) => {
-    const server = new McpServer({ name: "talenox-mcp", version: "0.1.0" });
-    registerAllTools(server, () => ({ talenox: req.talenoxClient! }));
+  app.post(
+    "/mcp",
+    requireBearerAuth({ provider: provider as any }),
+    async (req, res) => {
+      const server = new McpServer({ name: "talenox-mcp", version: "0.1.0" });
+      // req.auth is attached by requireBearerAuth from Task 8; its .token is
+      // Talenox's real access token (passed through untranslated per Task 7).
+      const talenox = new TalenoxClient((req as any).auth.token);
+      registerAllTools(server, () => ({ talenox }));
 
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
 
-    res.on("close", () => {
-      transport.close();
-      server.close();
-    });
+      res.on("close", () => {
+        transport.close();
+        server.close();
+      });
 
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  });
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    },
+  );
 
   return app;
 }
 ```
 
-**Note for implementer:** `StreamableHTTPServerTransport`'s exact constructor options and `handleRequest` signature may differ slightly by installed SDK version — check `node_modules/@modelcontextprotocol/sdk/dist/esm/server/streamableHttp.js` and adjust this wiring to match if it doesn't compile as written. The per-request `new McpServer()` + `new StreamableHTTPServerTransport()` pattern (stateless mode) is the important structural decision to preserve: each HTTP request gets its own server/transport pair scoped to that request's authenticated `TalenoxClient`, so one user's session can never leak into another's tool call.
+**Note for implementer:** `StreamableHTTPServerTransport`'s exact constructor options and `handleRequest` signature, and the exact property `requireBearerAuth` attaches auth info to (`req.auth` assumed here), may differ slightly by installed SDK version — check `node_modules/@modelcontextprotocol/sdk/dist/esm/server/streamableHttp.js` and `.../middleware/bearerAuth.js` and adjust this wiring to match if it doesn't compile as written. The per-request `new McpServer()` + `new StreamableHTTPServerTransport()` pattern (stateless mode) is the important structural decision to preserve: each HTTP request gets its own server/transport pair scoped to that request's authenticated Talenox access token, so one user's session can never leak into another's tool call.
 
-- [ ] **Step 6: Update the auth test from Task 8 to match the new response shape**
+- [ ] **Step 6: Update the auth tests from Task 8 to match the real tool-dispatch response**
 
 ```typescript
-// tests/mcp-server.test.ts — replace the "authenticated" assertion
-// (the 401/reconnect test and /health test are unchanged)
+// tests/mcp-server.test.ts — the 401 tests and /health test from Task 8 are
+// unchanged. Remove any assertion on the old { status: "authenticated" } stub
+// body, since /mcp now speaks the real MCP protocol instead of returning that
+// placeholder JSON.
 ```
 
 Remove any test asserting the old `{ status: "authenticated", ready: true }` stub body, since `/mcp` now speaks the real MCP protocol instead of returning that placeholder JSON.
@@ -2227,6 +2612,7 @@ git commit -m "docs(repo): add Render deploy config and setup instructions"
 
 ## Self-Review Notes
 
-- **Spec coverage:** Architecture (Task 8, 12, 13), Auth/persistent token store (Tasks 2-5, 7), Talenox client (Task 6), Tool set (Tasks 9-11), dry-run (Task 11), Error handling — Talenox errors passed through via `TalenoxApiError` (Task 6), reconnect-on-session-loss (Task 8) — all covered. Manual verification workflow is documented in Task 13's README rather than re-implemented as a task, since it's a human process, not code.
-- **Type consistency:** `ToolContext` is defined once in `src/tools/employees.ts` (Task 9) and imported by every later tools file (Tasks 10-12) rather than redefined — checked for drift across tasks.
-- **No placeholders:** every step has runnable code; the two "Note for implementer" callouts (Tasks 9 and 12) are flagged explicitly because `McpServer`/`StreamableHTTPServerTransport` internals are SDK-version-sensitive, not because the plan is leaving something undecided — the structural decision (per-request server/transport, `registerTool` contract) is fully specified either way.
+- **Spec coverage:** Architecture (Tasks 7, 8, 12, 13), Auth/persistent token store (Tasks 2, 3, 4, 5, 7), PKCE + dynamic client registration (Task 7, added during `/plan-ceo-review` after confirming claude.ai's connector requires it), Talenox client (Task 6), Tool set (Tasks 9-11), dry-run (Task 11), Error handling — Talenox errors passed through via `TalenoxApiError` (Task 6), invalid-grant/invalid-token on reconnect (Task 7/8) — all covered. Manual verification workflow is documented in Task 13's README rather than re-implemented as a task, since it's a human process, not code.
+- **Type consistency:** `ToolContext` is defined once in `src/tools/employees.ts` (Task 9) and imported by every later tools file (Tasks 10-12) rather than redefined — checked for drift across tasks. `IssuedGrant` (Task 5) is the single shape threaded through the shim, provider, and `exchangeAuthorizationCode`/`exchangeRefreshToken` — checked for drift there too after the Task 7/8 rewrite.
+- **No placeholders:** every step has runnable code. The "Note for implementer" callouts (Tasks 7, 8, 9, 12) are flagged explicitly because `OAuthServerProvider`/`mcpAuthRouter`/`requireBearerAuth`/`McpServer`/`StreamableHTTPServerTransport` internals are SDK-version-sensitive — not because the plan is leaving something undecided. The two literal `TODO(implementer)` comments in Task 7's `oauth-provider.ts` (mapping our generic errors to the SDK's exact invalid-grant/invalid-token error types) are the one spot where exact behavior depends on reading the installed SDK source first; the fallback behavior (throwing a plain `Error`) is still correct enough to fail closed (any error from these hooks results in the SDK rejecting the request), so this isn't a functional gap, just an unpolished error type.
+- **Post-review architecture change:** the original Tasks 3/5/7/8 (hand-rolled Express OAuth routes, session-id-keyed token store, proactive per-tool-call refresh) were replaced during `/plan-ceo-review`'s Step 0B/0C-bis after confirming (a) claude.ai's connector OAuth requires PKCE + dynamic client registration, which the hand-rolled routes didn't implement, and (b) Talenox's refresh grant is nonstandard (`code=<access_token>` param), which a transparent SDK proxy can't express. The revised design uses the SDK's `mcpAuthRouter` for spec compliance plus a custom `OAuthServerProvider` (Task 7) that mints its own opaque refresh token per grant and translates refresh calls into Talenox's actual shape. Tasks 1, 2, 4, 6, 9-13 were unaffected.
