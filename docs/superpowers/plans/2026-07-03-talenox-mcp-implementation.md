@@ -2708,3 +2708,272 @@ git commit -m "docs(repo): add Render deploy config and setup instructions"
 - **Type consistency:** `ToolContext` is defined once in `src/tools/employees.ts` (Task 9) and imported by every later tools file (Tasks 10-12) rather than redefined — checked for drift across tasks. `IssuedGrant` (Task 5) is the single shape threaded through the shim, provider, and `exchangeAuthorizationCode`/`exchangeRefreshToken` — checked for drift there too after the Task 7/8 rewrite.
 - **No placeholders:** every step has runnable code. The "Note for implementer" callouts (Tasks 7, 8, 9, 12) are flagged explicitly because `OAuthServerProvider`/`mcpAuthRouter`/`requireBearerAuth`/`McpServer`/`StreamableHTTPServerTransport` internals are SDK-version-sensitive — not because the plan is leaving something undecided. The two literal `TODO(implementer)` comments in Task 7's `oauth-provider.ts` (mapping our generic errors to the SDK's exact invalid-grant/invalid-token error types) are the one spot where exact behavior depends on reading the installed SDK source first; the fallback behavior (throwing a plain `Error`) is still correct enough to fail closed (any error from these hooks results in the SDK rejecting the request), so this isn't a functional gap, just an unpolished error type.
 - **Post-review architecture change:** the original Tasks 3/5/7/8 (hand-rolled Express OAuth routes, session-id-keyed token store, proactive per-tool-call refresh) were replaced during `/plan-ceo-review`'s Step 0B/0C-bis after confirming (a) claude.ai's connector OAuth requires PKCE + dynamic client registration, which the hand-rolled routes didn't implement, and (b) Talenox's refresh grant is nonstandard (`code=<access_token>` param), which a transparent SDK proxy can't express. The revised design uses the SDK's `mcpAuthRouter` for spec compliance plus a custom `OAuthServerProvider` (Task 7) that mints its own opaque refresh token per grant and translates refresh calls into Talenox's actual shape. Tasks 1, 2, 4, 6, 9-13 were unaffected.
+
+## NOT in Scope
+
+- **Leave management** (Leave, Leave Applications, Leave Approval Structure, Leave Approvers, Leave Off-in-Lieus, Leave Types, Leave Application/Attachments Flow) — this is the Lark ↔ Talenox leave-sync bridge from the original ask; deliberately deferred to a future phase, decided during brainstorming.
+- **Branches, Company Settings, Employee Roles, Holiday Policies, Jobs, Next of Kins, Working Days, Working Hours, Metadata, User Info (OAuth)** — one-time setup/config resources or employee-record details not touched by the stated payroll workflow; add only if a real gap surfaces during testing.
+- **Multi-region/multi-instance deployment, horizontal scaling** — single Render instance is correct for a single-user personal tool; revisit only if usage pattern changes materially.
+- **Durable dynamic-client-registration / pending-authorization storage across restarts** — both are in-memory by design (Task 7); acceptable because re-authentication is cheap and this isn't a high-availability multi-tenant service.
+- **Automated integration tests against the real Talenox API** — no sandbox environment is documented; testing strategy is unit tests + a manual verification checklist (Task 13) against the real account instead.
+
+## What Already Exists
+
+- **`xero-mcp-server`** (github.com/Zechst/xero-mcp-server) — supplied the tool-organization pattern (per-resource files, `register*Tools` functions) used in Tasks 9-11. Does not supply any remote/OAuth serving code (stdio-only), so nothing there was reused for Tasks 5-8.
+- **`lark-mcp-oauth`** (github.com/Zechst/lark-mcp-oauth) — supplied the "remote per-user OAuth deployment" pattern (encrypted token storage via env-var key, `PUBLIC_BASE_URL`-aware issuer, Render deploy shape) that Task 13's deploy config and Task 2/3's crypto/storage design are modeled on. Its Docker setup was explicitly NOT reused (see Architecture section) since it exists only to work around `keytar`'s OS-keychain dependency, which this project doesn't have.
+- **`@modelcontextprotocol/sdk`'s `mcpAuthRouter`/`OAuthServerProvider`** — discovered during this review's Landscape Check; supplies PKCE and dynamic client registration compliance for free, avoiding a from-scratch reimplementation that the original Task 7 draft would have required.
+
+## Dream State Delta
+
+```
+CURRENT STATE                    THIS PLAN                         12-MONTH IDEAL
+No Talenox automation --->  Remote MCP connector for  --->   Same connector, plus the
+at all, manual payroll      payroll (employees, pay-         Lark <-> Talenox leave-sync
+processing via the          ments, process/publish,          bridge (explicitly deferred),
+Talenox web UI only.        payslips), open-sourced,          possibly extended to other
+                             usable from claude.ai or          Talenox resources if a real
+                             Claude Code with dry-run           gap shows up in practice.
+                             safety on every write.
+```
+
+This plan moves directly toward the 12-month ideal — it's the payroll-automation foundation the leave-sync bridge would sit on top of later, not a detour from it.
+
+## Error & Rescue Registry
+
+| Method/Codepath | What Can Go Wrong | Exception Class | Rescued? | Rescue Action | User Sees |
+|---|---|---|---|---|---|
+| `TalenoxClient#request` | Talenox returns 4xx/5xx | `TalenoxApiError` | Y | Message passed through as-is | Original Talenox error text (e.g. "invalid cost centre id") |
+| `TalenoxClient#request` | Network failure (DNS, timeout, connection reset) | Native `fetch` rejection (e.g. `TypeError`) | Y (as of this review's fix) | Propagates to the tool handler, which the SDK's `registerTool` wrapper converts to `isError: true` — verified by Task 11's added test | Generic network error message |
+| `TalenoxGrantShim#refresh` | Unknown/expired opaque refresh token | `GrantNotFoundError` | Y | Mapped to `invalid_grant` in the OAuth provider | Client-side "reconnect" flow (standard OAuth invalid_grant handling) |
+| OAuth provider `verifyAccessToken` | Unknown/expired access token | Generic `Error("invalid_token")` | Y | Rejects the `/mcp` request with 401 | Client-side "reconnect" flow |
+| `TokenStore` (any method) | `MCP_ENCRYPTION_KEY` missing/malformed | `Error` (from `crypto.ts`'s `getKey()`) | Y (as of this review's fix) | Validated at boot in `src/index.ts`, process exits immediately with a clear message | Deploy fails loudly at startup, not mid-request |
+| `oauth-provider.ts` exchange/refresh/verify hooks | Any of the above during an in-flight OAuth exchange | Various | Y | Logged via `console.log` structured events (this review's fix) | Standard OAuth error response to the client |
+
+## Failure Modes Registry
+
+| Codepath | Failure Mode | Rescued? | Test? | User Sees | Logged? |
+|---|---|---|---|---|---|
+| `TalenoxClient#request` | Talenox 4xx/5xx | Y | Y (Task 6) | Original error text | N (not yet — acceptable at personal-project scale; add if needed) |
+| Tool handler (any) | `TalenoxClient` call throws | Y | Y (Task 11, added this review) | MCP `isError` result | Y (Task 12's logging wrapper, added this review) |
+| `PendingAuthorizations` | Abandoned `/authorize` never completed | Y | Y (Task 7, added this review) | N/A (no user-visible effect) | N (sweep is silent by design — low-severity path) |
+| `TalenoxGrantShim#refresh` | Stale/invalid refresh token | Y | Y (Task 5) | Standard OAuth reconnect flow | Y (Task 7's logging, added this review) |
+| `oauth-provider` PKCE challenge mismatch | Client sends wrong `code_verifier` | Handled by the SDK's `mcpAuthRouter`, not this plan's code | N (relies on SDK's own tests) | Standard OAuth PKCE failure | Depends on SDK |
+
+No row has all three of RESCUED=N, TEST=N, and USER SEES=Silent — no CRITICAL GAPs found.
+
+## TODOS.md Candidates (not blocking — proposed for later, not built now)
+
+- **Structured metrics/alerting beyond console logs** (P3) — if this ever needs to run unattended for a while, plain `console.log` lines are enough to debug after the fact manually, but a real metrics/alerting layer would be needed for unattended reliability. Deferred: personal-scale usage doesn't need it yet.
+- **Automated smoke test against a disposable Talenox sandbox, if Talenox ever offers one** (P3) — would remove the "manual dashboard verification" dependency for regression-testing writes. Deferred: no sandbox is documented today, so there's nothing to automate against.
+- **Durable dynamic-client-registration storage** (P3) — currently in-memory (Task 7); losing it on restart just means claude.ai re-registers automatically, so this is low priority. Deferred: not worth the SQLite schema addition until it's actually annoying in practice.
+
+## Outside Voice — Independent Plan Challenge
+
+Not run this session — Codex CLI availability wasn't probed in this environment. Given the plan already went through one architecture correction (Approach C's SDK-based OAuth redesign) driven by concrete platform-requirement research rather than speculation, and given this is a personal-scope project rather than a team/production system, I'd recommend running `/codex review` manually against this plan file if you want a second independent opinion before implementation — but it isn't required to proceed.
+
+## Diagrams
+
+```
+System architecture (new components, HOLD SCOPE — showing the post-review design):
+
+  claude.ai / Claude Code
+        │  HTTPS
+        ▼
+  ┌─────────────────────────── talenox-mcp (Render, single instance) ───────────────────────────┐
+  │                                                                                                │
+  │   GET /health           GET /.well-known/oauth-authorization-server   POST /mcp               │
+  │        │                          │  (mcpAuthRouter)                     │                    │
+  │        │                          ▼                                requireBearerAuth          │
+  │        │                  OAuthServerProvider (Task 7)                   │                    │
+  │        │                  ┌──────────────────────┐                      ▼                    │
+  │        │                  │ authorize()──────────┼──▶ Talenox /oauth/authorize (real)         │
+  │        │                  │ callbackHandler ◀─────┼──── Talenox redirects back                │
+  │        │                  │ exchangeAuthCode()    │                                            │
+  │        │                  │ exchangeRefreshToken()├──▶ TalenoxGrantShim (Task 5)               │
+  │        │                  │ verifyAccessToken()   │        │                                  │
+  │        │                  └──────────────────────┘        ▼                                  │
+  │        │                                            TokenStore (Task 3, SQLite on disk)        │
+  │        │                                                   │                                  │
+  │        ▼                                                   ▼                                  │
+  │   { status: "ok" }                                 exchangeCodeForTokens / refreshTokens        │
+  │                                                     (Task 4) ──▶ Talenox /oauth/token (real)   │
+  │                                                                                                │
+  │   McpServer + StreamableHTTPServerTransport (Task 8/12, per-request)                            │
+  │        │                                                                                        │
+  │        ▼                                                                                        │
+  │   registerAllTools ──▶ employees.ts / pay-items.ts / cost-centres.ts / payroll.ts (Tasks 9-11)  │
+  │        │                                                                                        │
+  │        ▼                                                                                        │
+  │   TalenoxClient (Task 6) ──▶ Talenox REST API v2 (real)                                          │
+  └────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```
+Data flow — OAuth token exchange (happy + shadow paths):
+
+  authorize() ──▶ handoff stored ──▶ Talenox authorize ──▶ callback ──▶ shim.exchange ──▶ grant stored
+       │                                                        │              │
+       ▼                                                        ▼              ▼
+  [nil params?]                                          [nil/expired      [Talenox 4xx/5xx?]
+  SDK validates                                            handoff?]        propagates as
+  before calling us                                        400 response     TalenoxApiError
+                                                                             (Task 6, rescued)
+```
+
+```
+State machine — a single grant's lifecycle (Task 3/5):
+
+  (none) ──createGrant──▶ [ACTIVE, keyed by grantId=A]
+                                │
+                                │ client calls refresh(A)
+                                ▼
+                    rotateGrant(A → B) [atomic: delete A, insert B]
+                                │
+                                ▼
+                          [ACTIVE, keyed by grantId=B]
+                                │
+                                │ client calls refresh(B) again...
+                                ▼
+                              (repeats)
+
+  Invalid transition prevented: refresh(A) after A has already been rotated to B
+  finds no row for A (deleted atomically) → GrantNotFoundError → invalid_grant,
+  never a partial/corrupt state with both A and B alive or neither.
+```
+
+```
+Error flow (tool call):
+
+  Claude calls tool ──▶ handler runs ──▶ TalenoxClient call
+                              │                  │
+                              │            success│failure
+                              │                  │    │
+                              ▼                  ▼    ▼
+                        console.log         result  TalenoxApiError thrown
+                        "tool.invoke"          │           │
+                                               ▼           ▼
+                                        console.log   console.log "tool.error"
+                                        "tool.result"       │
+                                                            ▼
+                                                   SDK wraps as isError:true
+                                                   (verified by Task 11's test)
+```
+
+```
+Deployment sequence (Task 13):
+
+  git push ──▶ Render Blueprint build (npm ci && npm run build)
+                        │
+                        ▼
+             Start (npm start) with env vars set
+                        │
+                        ▼
+       Boot-time validation (this review's fix): PUBLIC_BASE_URL,
+       TALENOX_CLIENT_ID/SECRET, MCP_ENCRYPTION_KEY all checked —
+       fails loudly here, not mid-request, if misconfigured
+                        │
+                        ▼
+              Manual validation checklist (Task 13 README):
+              read-only tool → dry_run write → real small write
+              → dashboard check → process/publish on smallest cycle
+```
+
+```
+Rollback flowchart:
+
+  Bad deploy detected ──▶ git revert the offending commit ──▶ push ──▶ Render redeploys
+                                                                            │
+                                                                            ▼
+                                                          Grant data is session-transient —
+                                                          no destructive migration to undo,
+                                                          users just reconnect if needed
+```
+
+## Stale Diagram Audit
+
+No pre-existing diagrams in this repo (fresh project) — nothing to audit for staleness.
+
+## Implementation Tasks
+
+Synthesized from this review's findings. Each task derives from a specific finding above.
+
+- [ ] **T1 (P2, human: ~10min / CC: ~2min)** — auth — validate `MCP_ENCRYPTION_KEY` format at boot
+  - Surfaced by: Section 2 (Error & Rescue Map) — missing startup validation gap
+  - Files: `src/index.ts`
+  - Verify: boot with a missing/malformed key, confirm it throws immediately with a clear message (already written into Task 8)
+- [ ] **T2 (P1, human: ~20min / CC: ~5min)** — tools — verify/enforce error-to-isError conversion in tool handlers
+  - Surfaced by: Section 2/6 (Error Map, Test Review) — unverified SDK error-propagation contract
+  - Files: `src/tools/payroll.ts`, `tests/tools/payroll.test.ts` (already written into Task 11)
+  - Verify: `npx vitest run tests/tools/payroll.test.ts` — if it fails, apply the try/catch fallback noted in Task 11
+- [ ] **T3 (P3, human: ~10min / CC: ~2min)** — tools — deduplicate `textResult` into a shared module
+  - Surfaced by: Section 5 (Code Quality) — 4x duplicated helper
+  - Files: `src/tools/shared.ts`, `src/tools/employees.ts`, `src/tools/pay-items.ts`, `src/tools/cost-centres.ts`, `src/tools/payroll.ts` (already written into Task 9)
+  - Verify: all tool test files still pass after the import change
+- [ ] **T4 (P2, human: ~20min / CC: ~5min)** — observability — add structured invocation logging + pending-authorization sweep
+  - Surfaced by: Section 8 (Observability), Section 3 (Security — unbounded memory growth)
+  - Files: `src/tools/index.ts`, `src/auth/oauth-provider.ts`, `src/auth/pending-authorizations.ts` (already written into Tasks 7/12)
+  - Verify: `npx vitest run tests/auth/pending-authorizations.test.ts` (sweep test), manual check of `console.log` output during a local test run
+
+_No new tasks from Sections 1, 4, 7, 9, 10, 11 — no unaddressed findings there._
+
+## Completion Summary
+
+```
++====================================================================+
+|            MEGA PLAN REVIEW — COMPLETION SUMMARY                   |
++====================================================================+
+| Mode selected        | HOLD SCOPE (no response to mode question,   |
+|                       | proceeded with recommended default)         |
+| System Audit         | Fresh repo, 3 commits pre-review, no TODOs, |
+|                       | no prior review cycles                      |
+| Step 0               | Approach C (SDK auth + refresh shim) chosen |
+|                       | after landscape check found PKCE/dynamic-   |
+|                       | client-registration requirement             |
+| Section 1  (Arch)    | 0 blocking issues (see finding 4, resolved) |
+| Section 2  (Errors)  | 6 codepaths mapped, 2 GAPS found & fixed    |
+| Section 3  (Security)| 1 issue found & fixed (unbounded memory)    |
+| Section 4  (Data/UX) | 0 unhandled edge cases (loose zod noted,    |
+|                       | not blocking)                               |
+| Section 5  (Quality) | 1 DRY violation found & fixed                |
+| Section 6  (Tests)   | Diagram produced, 1 gap found & fixed        |
+| Section 7  (Perf)    | 0 issues (documented tradeoff, not a gap)    |
+| Section 8  (Observ)  | 1 gap found & fixed (zero logging)           |
+| Section 9  (Deploy)  | 0 risks flagged beyond what Task 13 covers   |
+| Section 10 (Future)  | Reversibility: 4/5, debt items: 3 (all P3)   |
+| Section 11 (Design)  | SKIPPED (no UI scope)                        |
++--------------------------------------------------------------------+
+| NOT in scope         | written (5 items)                            |
+| What already exists  | written (3 items)                            |
+| Dream state delta    | written                                       |
+| Error/rescue registry| 6 methods, 0 CRITICAL GAPS                   |
+| Failure modes        | 5 total, 0 CRITICAL GAPS                     |
+| TODOS.md updates     | 3 items proposed (not built, all P3)         |
+| Scope proposals      | N/A (HOLD SCOPE — no expansions surfaced)    |
+| CEO plan             | skipped (HOLD SCOPE)                         |
+| Outside voice        | skipped (not probed this session)            |
+| Diagrams produced    | 6 (architecture, data flow, state machine,   |
+|                       | error flow, deployment sequence, rollback)   |
+| Stale diagrams found | 0 (fresh project)                            |
+| Unresolved decisions | 1 (mode selection defaulted, see below)      |
++====================================================================+
+```
+
+## Unresolved Decisions
+
+- The Step 0F mode-selection question (HOLD SCOPE / SELECTIVE EXPANSION / SCOPE EXPANSION) went unanswered after 60s; proceeded with the recommended HOLD SCOPE default per the user's prior explicit scope-locking behavior earlier in this conversation. If SELECTIVE EXPANSION or SCOPE EXPANSION was actually intended, re-run this review section with that mode selected.
+- The four Section 2/3/5/8 findings (boot validation, error-propagation test, DRY textResult, logging + sweep) were also auto-applied after a 60s AskUserQuestion timeout, using the recommended option for each. All four are additive, non-destructive changes to the plan document only (no code has been written yet) — review the diff in `docs/superpowers/plans/2026-07-03-talenox-mcp-implementation.md` and flag anything you'd rather revert before implementation begins.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | 4 findings, 4 fixed; 1 unresolved (mode selection defaulted) |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | not run |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | not run |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | N/A (no UI scope) |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | not run |
+
+**VERDICT:** CEO review complete with all findings resolved in-plan; eng review required before implementation (Eng Review not yet run — this is a personal-scope project, so running `/plan-eng-review` is optional but recommended before starting Task 1, given the OAuth architecture is genuinely nontrivial).
+
+**UNRESOLVED DECISIONS:**
+- Mode selection (HOLD SCOPE vs SELECTIVE/SCOPE EXPANSION) defaulted after a 60s timeout — confirm HOLD SCOPE was the right call, or re-run with a different mode.
