@@ -78,6 +78,15 @@ describe("exchangeCodeForTokens / refreshTokens", () => {
     });
 
     expect(result).toEqual(mockResponse);
+    // Verify the fetch call sent the access token as the 'code' param, not the refresh token
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining("code=acc-1"),
+      expect.any(Object),
+    );
+    expect(global.fetch).not.toHaveBeenCalledWith(
+      expect.stringContaining("code=ref-1"),
+      expect.any(Object),
+    );
   });
 
   it("throws when Talenox returns a non-ok response", async () => {
