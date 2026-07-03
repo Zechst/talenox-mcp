@@ -1,14 +1,9 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { TalenoxClient } from "../talenox/client.js";
-import { textResult } from "./shared.js";
+import { textResult, toErrorResult } from "./shared.js";
 
 export type ToolContext = { talenox: TalenoxClient };
-
-function toErrorResult(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
-  return { content: [{ type: "text" as const, text: message }], isError: true };
-}
 
 export function registerEmployeeTools(
   server: McpServer,
