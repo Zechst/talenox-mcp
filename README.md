@@ -5,9 +5,8 @@ drive Talenox payroll: employees, adhoc/recurring/attendance/leave payments,
 process/publish/unpublish, exports, and payslips. Each user authenticates as
 their own Talenox account via OAuth.
 
-Leave management, Lark integration, and non-payroll Talenox resources
-(branches, holiday policies, working hours, etc.) are explicitly out of scope
-— see `docs/superpowers/specs/2026-07-03-talenox-mcp-design.md`.
+Leave management and non-payroll Talenox resources (branches, holiday
+policies, working hours, etc.) are out of scope for now.
 
 ## Setup
 
@@ -56,5 +55,6 @@ claude mcp add --transport http --scope user talenox https://<name>.onrender.com
 - Ask it to list employees (read-only, confirms auth).
 - Try a payment tool with `dry_run: true` first, inspect the payload.
 - Run a real write on something small, then confirm in the Talenox dashboard.
-- See the design doc's Testing & Verification section for the full checklist
-  before trusting `process_payroll` / `publish_payroll` unattended.
+- Before trusting `process_payroll` / `publish_payroll` unattended, run them
+  once on the smallest real cycle you can and confirm the result in the
+  Talenox dashboard matches what Claude reported.
