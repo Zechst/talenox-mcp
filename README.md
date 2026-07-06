@@ -16,8 +16,9 @@ policies, working hours, etc.) are out of scope for now.
 2. Top-right nav → API Settings → OAuth 2.0 developer page.
 3. Create an app: name it, set Redirect URI to
    `https://<your-service>.onrender.com/callback`. Set the scope to exactly
-   `payroll` — the server requests this scope by default (`src/index.ts`) and
-   any mismatch will cause the OAuth authorize step to fail.
+   `payroll profile` — the server requests this scope by default
+   (`src/index.ts`) and any mismatch will cause the OAuth authorize step to
+   fail.
 4. Copy the generated Client ID and Client Secret.
 
 ### 2. Generate an encryption key
