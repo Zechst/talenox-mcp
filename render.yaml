@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: talenox-mcp
+    plan: starter
+    env: node
+    region: singapore
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    disk:
+      name: talenox-mcp-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: TALENOX_CLIENT_ID
+        sync: false
+      - key: TALENOX_CLIENT_SECRET
+        sync: false
+      - key: MCP_ENCRYPTION_KEY
+        sync: false
+      - key: TOKEN_STORE_PATH
+        value: /data/tokens.db
