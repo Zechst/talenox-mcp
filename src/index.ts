@@ -27,7 +27,7 @@ const app = createApp({
   publicBaseUrl,
   talenoxClientId,
   talenoxClientSecret,
-  scope: "payroll",
+  scope: "payroll profile",
   store,
 });
 
