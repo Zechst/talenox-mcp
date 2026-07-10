@@ -299,6 +299,53 @@ describe("payroll tools", () => {
     });
   });
 
+  it.each([
+    ["delete_adhoc_payment", "payroll/adhoc_payment/3"],
+    ["delete_recurring_payment", "payroll/recurring_payment/5"],
+    ["delete_attendance_payment", "payroll/attendance_payment/3"],
+    ["delete_leave_payment", "payroll/leave_payment_or_deduction/3"],
+    ["delete_payroll_payment", "payroll/payroll_payment/7"],
+  ])("%s calls DELETE %s", async (toolName, expectedPath) => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = { delete: vi.fn().mockResolvedValue({ id: 3 }) } as unknown as TalenoxClient;
+    registerPayrollTools(server, () => ({ talenox }));
+
+    const id = expectedPath.split("/").pop() as string;
+    const tool = getTool(server, toolName);
+    const result = await tool.handler({ id }, {});
+
+    expect(talenox.delete).toHaveBeenCalledWith(expectedPath);
+    expect(result.content[0].text).toContain("3");
+  });
+
+  it("delete_adhoc_payment short-circuits on dry_run, never calling talenox.delete", async () => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = { delete: vi.fn() } as unknown as TalenoxClient;
+    registerPayrollTools(server, () => ({ talenox }));
+
+    const tool = getTool(server, "delete_adhoc_payment");
+    const result = await tool.handler({ id: "3", dry_run: true }, {});
+
+    expect(talenox.delete).not.toHaveBeenCalled();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.dry_run).toBe(true);
+    expect(parsed.would_send.path).toBe("payroll/adhoc_payment/3");
+  });
+
+  it("delete_adhoc_payment surfaces a TalenoxApiError as an MCP error result", async () => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = {
+      delete: vi.fn().mockRejectedValue(new TalenoxApiError(404, "pay item not found")),
+    } as unknown as TalenoxClient;
+    registerPayrollTools(server, () => ({ talenox }));
+
+    const tool = getTool(server, "delete_adhoc_payment");
+    const result = await tool.handler({ id: "999" }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("pay item not found");
+  });
+
   it("surfaces a thrown TalenoxApiError as an MCP error result, not an unhandled rejection", async () => {
     const server = new McpServer({ name: "test", version: "0.0.0" });
     const talenox = {
