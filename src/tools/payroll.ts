@@ -73,6 +73,37 @@ function registerPayrollActionTool(
   );
 }
 
+const deleteItemSchema = {
+  id: nonEmptyId,
+  dry_run: z.boolean().optional(),
+};
+
+function registerDeleteTool(
+  server: McpServer,
+  getContext: (extra: unknown) => ToolContext,
+  name: string,
+  pathFor: (id: string) => string,
+  description: string,
+) {
+  server.registerTool(
+    name,
+    { description, inputSchema: deleteItemSchema },
+    async (args, extra) => {
+      try {
+        const path = pathFor(encodeURIComponent(args.id));
+        if (args.dry_run) {
+          return dryRunResult(path, undefined);
+        }
+        const { talenox } = getContext(extra);
+        const result = await talenox.delete(path);
+        return textResult(result);
+      } catch (error) {
+        return toErrorResult(error);
+      }
+    },
+  );
+}
+
 export function registerPayrollTools(
   server: McpServer,
   getContext: (extra: unknown) => ToolContext,
@@ -172,6 +203,35 @@ export function registerPayrollTools(
     "Create a leave-based payroll payment or deduction. `payment` needs year/month/period (or an existing payment id); `pay_items` supports override_working_days. Supports dry_run.",
   );
 
+  registerDeleteTool(
+    server,
+    getContext,
+    "delete_adhoc_payment",
+    (id) => `payroll/adhoc_payment/${id}`,
+    "Delete an adhoc pay item by id. This is hard to reverse in Talenox — confirm with the user before calling without dry_run.",
+  );
+  registerDeleteTool(
+    server,
+    getContext,
+    "delete_recurring_payment",
+    (id) => `payroll/recurring_payment/${id}`,
+    "Delete a recurring pay item by id. This is hard to reverse in Talenox — confirm with the user before calling without dry_run.",
+  );
+  registerDeleteTool(
+    server,
+    getContext,
+    "delete_attendance_payment",
+    (id) => `payroll/attendance_payment/${id}`,
+    "Delete an attendance pay item by id. This is hard to reverse in Talenox — confirm with the user before calling without dry_run.",
+  );
+  registerDeleteTool(
+    server,
+    getContext,
+    "delete_leave_payment",
+    (id) => `payroll/leave_payment_or_deduction/${id}`,
+    "Delete a leave pay item or deduction by id. This is hard to reverse in Talenox — confirm with the user before calling without dry_run.",
+  );
+
   registerPayrollActionTool(
     server,
     getContext,
@@ -185,6 +245,13 @@ export function registerPayrollTools(
     "draft_payroll_payment",
     (id) => `payroll/payroll_payment/${id}/draft`,
     "Revert a processed payroll payment/run back to Draft status by id. This changes live payroll state — confirm with the user before calling without dry_run.",
+  );
+  registerDeleteTool(
+    server,
+    getContext,
+    "delete_payroll_payment",
+    (id) => `payroll/payroll_payment/${id}`,
+    "Delete a payroll payment/run by id, along with its pay items. This is hard to reverse in Talenox — confirm with the user before calling without dry_run.",
   );
 
   server.registerTool(
