@@ -79,9 +79,16 @@ describe("job tools", () => {
     expect(result.content[0].text).toContain("8");
   });
 
-  it("registers update_employee_job, calling PUT jobs/:job_id with { job }", async () => {
+  it("registers update_employee_job, reading the existing job and merging the partial update before PUT", async () => {
     const server = new McpServer({ name: "test", version: "0.0.0" });
     const talenox = makeMockTalenox();
+    (talenox.get as any).mockResolvedValue({
+      id: 7,
+      title: "Front-end Developer",
+      department: "Engineering & Technology",
+      start_date: "01/09/2025",
+      end_date: "12/06/2026",
+    });
     (talenox.put as any).mockResolvedValue({ id: 7, end_date: "30/06/2026" });
 
     registerJobTools(server, () => ({ talenox }));
@@ -89,8 +96,32 @@ describe("job tools", () => {
     const tool = getRegisteredTool(server, "update_employee_job");
     const result = await tool.handler({ job_id: "7", job: { end_date: "30/06/2026" } }, {});
 
-    expect(talenox.put).toHaveBeenCalledWith("jobs/7", { job: { end_date: "30/06/2026" } });
+    expect(talenox.get).toHaveBeenCalledWith("jobs/7");
+    expect(talenox.put).toHaveBeenCalledWith("jobs/7", {
+      job: {
+        id: 7,
+        title: "Front-end Developer",
+        department: "Engineering & Technology",
+        start_date: "01/09/2025",
+        end_date: "30/06/2026",
+      },
+    });
     expect(result.content[0].text).toContain("30/06/2026");
+  });
+
+  it("update_employee_job surfaces a TalenoxApiError from the read step", async () => {
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    const talenox = makeMockTalenox();
+    (talenox.get as any).mockRejectedValue(new TalenoxApiError(404, "job not found"));
+
+    registerJobTools(server, () => ({ talenox }));
+
+    const tool = getRegisteredTool(server, "update_employee_job");
+    const result = await tool.handler({ job_id: "999", job: { end_date: "30/06/2026" } }, {});
+
+    expect(talenox.put).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("job not found");
   });
 
   it("registers delete_employee_job, calling DELETE jobs/:job_id", async () => {
