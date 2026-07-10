@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerEmployeeTools, type ToolContext } from "./employees.js";
+import { registerJobTools } from "./jobs.js";
 import { registerPayItemTools } from "./pay-items.js";
 import { registerCostCentreTools } from "./cost-centres.js";
 import { registerPayrollTools } from "./payroll.js";
@@ -52,6 +53,7 @@ export function registerAllTools(
 ): void {
   const loggedServer = withInvocationLogging(server);
   registerEmployeeTools(loggedServer, getContext);
+  registerJobTools(loggedServer, getContext);
   registerPayItemTools(loggedServer, getContext);
   registerCostCentreTools(loggedServer, getContext);
   registerPayrollTools(loggedServer, getContext);
