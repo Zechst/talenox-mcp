@@ -72,7 +72,8 @@ export function registerJobTools(
   server.registerTool(
     "update_employee_job",
     {
-      description: `Update an existing job/role record by job id, e.g. to set its start_date or end_date. ${DATE_FORMAT_NOTE}`,
+      description:
+        `Update an existing job/role record by job id, e.g. to set its start_date or end_date. Only the fields you pass in \`job\` are changed — other fields on the record are read first and preserved, since Talenox's PUT replaces the whole record. ${DATE_FORMAT_NOTE}`,
       inputSchema: {
         job_id: nonEmptyId,
         job: z.record(z.string(), z.unknown()),
@@ -81,9 +82,9 @@ export function registerJobTools(
     async (args: { job_id: string; job: Record<string, unknown> }, extra: unknown) => {
       try {
         const { talenox } = getContext(extra);
-        const result = await talenox.put(`jobs/${encodeURIComponent(args.job_id)}`, {
-          job: args.job,
-        });
+        const path = `jobs/${encodeURIComponent(args.job_id)}`;
+        const existing = await talenox.get<Record<string, unknown>>(path);
+        const result = await talenox.put(path, { job: { ...existing, ...args.job } });
         return textResult(result);
       } catch (error) {
         return toErrorResult(error);
